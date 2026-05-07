@@ -1,0 +1,29 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Data — large files not committed
+data/
+
+# Virtual environments
+.venv
+
+# Secrets
+.env
+
+# Output artefacts — generated at runtime, not source code
+*.xlsx
+*.csv
+backtest_*.csv
+backtest_*.xlsx
+logs/
+.DS_Store
+tracker_*.xlsx
+today/today_predictions.xlsx
+cronjob/comparison_results.xlsx
+cronjob/og_results.xlsx
+cronjob/our_predictions.xlsx
