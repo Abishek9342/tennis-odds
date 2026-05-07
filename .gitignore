@@ -6,8 +6,8 @@ dist/
 wheels/
 *.egg-info
 
-# Data — large files not committed
-data/
+# DS_Store inside data
+data/**/.DS_Store
 
 # Virtual environments
 .venv
