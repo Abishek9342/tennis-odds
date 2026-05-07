@@ -168,7 +168,7 @@ def main():
     st.title("ATP Tennis Match Predictor")
     st.caption(
         "LightGBM model trained on 2000–2026 ATP data from tennis-data.co.uk.  "
-        "No-odds CV AUC: **0.720** · With-odds CV AUC: **0.749** · Pinnacle baseline: 0.749"
+        "No-odds CV AUC: **0.740** · With-odds CV AUC: **0.763** · Test holdout AUC: **0.753**"
     )
 
     # Load cached resources
@@ -188,10 +188,6 @@ def main():
         p2 = st.selectbox("Player 2", players, index=default_p2)
         surface = st.selectbox("Surface", ["Hard", "Clay", "Grass", "Carpet"])
 
-        st.subheader("Match context")
-        is_grand_slam = st.checkbox("Grand Slam?", value=False)
-        best_of       = st.radio("Best of", [3, 5], horizontal=True)
-        round_label   = st.selectbox("Round", ["R128", "R64", "R32", "R16", "QF", "SF", "F", "RR"])
 
         st.subheader("Bookmaker odds (optional)")
         with st.expander("Enter available odds"):
@@ -231,9 +227,9 @@ def main():
         feat.update(model_mod._compute_rank_features(p1_rank, p2_rank, max_rank))
 
         # Tournament context features (previously always NaN at inference)
-        feat["is_grand_slam"] = 1.0 if is_grand_slam else 0.0
-        feat["is_best_of_5"]  = 1.0 if best_of == 5 else 0.0
-        feat["round_num"]     = float(feat_mod.ROUND_MAP.get(round_label, float("nan")))
+        feat["is_grand_slam"] = 0.0
+        feat["is_best_of_5"]  = 0.0
+        feat["round_num"]     = float("nan")
         feat["surface_code"]  = float(feat_mod.SURFACE_MAP.get(surface, float("nan")))
 
         odds: dict = {}

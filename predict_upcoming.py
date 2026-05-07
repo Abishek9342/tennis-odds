@@ -175,19 +175,29 @@ def kelly(prob: float, decimal_odds: float, fraction: float = KELLY_FRACTION) ->
     return round(k * fraction, 4)
 
 
+def _vig_free_prob(odds_w: float, odds_l: float) -> tuple[float, float]:
+    """Return vig-free (margin-removed) probabilities from decimal odds pair."""
+    raw_w, raw_l = 1 / odds_w, 1 / odds_l
+    total = raw_w + raw_l
+    return raw_w / total, raw_l / total
+
+
 def _bet_rec(prob_p1: float, prob_p2: float, p1_odds: float | None, p2_odds: float | None,
              p1_name: str, p2_name: str) -> tuple[str, str, str]:
     """Apply decision engine and return (kelly_p1_str, kelly_p2_str, recommendation)."""
     if not p1_odds or not p2_odds:
         return "—", "—", "No odds available"
 
-    def _edge(prob: float, odds: float) -> float:
-        return prob - (1.0 / odds)
+    # Edge vs vig-free probability (not raw implied — removes bookmaker margin bias)
+    vf_p1, vf_p2 = _vig_free_prob(p1_odds, p2_odds)
+
+    def _edge(prob: float, vf: float) -> float:
+        return prob - vf
 
     k1 = kelly(prob_p1, p1_odds)
     k2 = kelly(prob_p2, p2_odds)
-    e1 = _edge(prob_p1, p1_odds)
-    e2 = _edge(prob_p2, p2_odds)
+    e1 = _edge(prob_p1, vf_p1)
+    e2 = _edge(prob_p2, vf_p2)
 
     kelly_p1_str = f"{k1:.4f}" if k1 > 0 else "—"
     kelly_p2_str = f"{k2:.4f}" if k2 > 0 else "—"
@@ -196,16 +206,16 @@ def _bet_rec(prob_p1: float, prob_p2: float, p1_odds: float | None, p2_odds: flo
         return (edge_val >= MIN_EDGE and prob >= MIN_CONFIDENCE and odds >= MIN_ODDS)
 
     if _qualifies(prob_p1, p1_odds, e1) and k1 >= k2:
-        rec = f"BET {p1_name} — QKelly {k1:.2%} of bankroll (edge {e1:.1%})"
+        rec = f"BET {p1_name} — QKelly {k1:.2%} of bankroll (edge vs Pinnacle {e1:+.1%})"
     elif _qualifies(prob_p2, p2_odds, e2) and k2 > k1:
-        rec = f"BET {p2_name} — QKelly {k2:.2%} of bankroll (edge {e2:.1%})"
+        rec = f"BET {p2_name} — QKelly {k2:.2%} of bankroll (edge vs Pinnacle {e2:+.1%})"
     else:
         reasons = []
         best_prob  = max(prob_p1, prob_p2)
         best_edge  = max(e1, e2)
         best_odds  = p1_odds if prob_p1 >= prob_p2 else p2_odds
         if best_edge < MIN_EDGE:
-            reasons.append(f"edge {best_edge:.1%} < {MIN_EDGE:.0%}")
+            reasons.append(f"edge {best_edge:+.1%} < {MIN_EDGE:.0%}")
         if best_prob < MIN_CONFIDENCE:
             reasons.append(f"conf {best_prob:.1%} < {MIN_CONFIDENCE:.0%}")
         if best_odds < MIN_ODDS:
@@ -286,7 +296,7 @@ def main():
     live_ranks = fetch_live_ranks(known)
 
     # ── 4. Live odds ──────────────────────────────────────────────────────────
-    api_key = os.getenv("ODDS_API_KEY", "")
+    api_key = os.getenv("ODDS_API_KEY", "9fa97db9dc2ab4251273aea368c1e457")
     live_odds_map: dict = {}
     if not args.no_odds and api_key:
         print("Fetching live odds from The Odds API...")
@@ -369,11 +379,17 @@ def main():
             prob_p1_odds = float(booster_odds.predict(X_odds)[0])
             prob_p2_odds = 1.0 - prob_p1_odds
 
+            # Ensemble: blend with-odds and no-odds models (65/35 weight)
+            ENSEMBLE_W = 0.65
+            prob_p1_ensemble = ENSEMBLE_W * prob_p1_odds + (1 - ENSEMBLE_W) * prob_p1_no
+            prob_p2_ensemble = 1.0 - prob_p1_ensemble
+
             p1_dec_odds = match_odds["psw"]
             p2_dec_odds = match_odds["psl"]
 
+            # Use ensemble probability for Kelly/bet decision
             kelly_p1, kelly_p2, bet_rec = _bet_rec(
-                prob_p1_odds, prob_p2_odds, p1_dec_odds, p2_dec_odds, p1, p2
+                prob_p1_ensemble, prob_p2_ensemble, p1_dec_odds, p2_dec_odds, p1, p2
             )
 
         favourite = p1 if prob_p1_no >= prob_p2_no else p2
