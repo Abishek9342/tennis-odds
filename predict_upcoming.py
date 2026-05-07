@@ -356,6 +356,7 @@ def main():
 
         # ── Odds prediction + Kelly ───────────────────────────────────────────
         prob_p1_odds = prob_p2_odds = None
+        prob_p1_ensemble = prob_p2_ensemble = None
         kelly_p1 = kelly_p2 = "—"
         p1_dec_odds = p2_dec_odds = "—"
         bet_rec = "No odds available"
@@ -392,8 +393,10 @@ def main():
                 prob_p1_ensemble, prob_p2_ensemble, p1_dec_odds, p2_dec_odds, p1, p2
             )
 
-        favourite = p1 if prob_p1_no >= prob_p2_no else p2
-        conf      = max(prob_p1_no, prob_p2_no)
+        # Favourite: use ensemble when available, else no-odds
+        _fav_prob_p1 = prob_p1_ensemble if prob_p1_ensemble is not None else prob_p1_no
+        favourite = p1 if _fav_prob_p1 >= 0.5 else p2
+        conf      = max(_fav_prob_p1, 1.0 - _fav_prob_p1)
 
         # Dollar stake — only when we have a concrete bet recommendation
         bankroll = args.bankroll
@@ -416,6 +419,8 @@ def main():
             "P2 Win % (no odds)":  f"{prob_p2_no:.1%}",
             "P1 Win % (odds)":     f"{prob_p1_odds:.1%}" if prob_p1_odds is not None else "—",
             "P2 Win % (odds)":     f"{prob_p2_odds:.1%}" if prob_p2_odds is not None else "—",
+            "P1 Win % (ensemble)": f"{prob_p1_ensemble:.1%}" if prob_p1_ensemble is not None else "—",
+            "P2 Win % (ensemble)": f"{prob_p2_ensemble:.1%}" if prob_p2_ensemble is not None else "—",
             "Pinnacle P1 Odds":    p1_dec_odds,
             "Pinnacle P2 Odds":    p2_dec_odds,
             "Bet365 P1 Odds":      b365_p1_odds,
@@ -436,6 +441,7 @@ def main():
         "P1 Rank (live)", "P2 Rank (live)",
         "P1 Win % (no odds)", "P2 Win % (no odds)",
         "P1 Win % (odds)", "P2 Win % (odds)",
+        "P1 Win % (ensemble)", "P2 Win % (ensemble)",
         "Pinnacle P1 Odds", "Pinnacle P2 Odds",
         "Bet365 P1 Odds", "Bet365 P2 Odds",
         "Kelly P1 (fraction)", "Kelly P2 (fraction)",

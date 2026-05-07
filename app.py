@@ -243,19 +243,27 @@ def main():
             odds["maxw"] = maxw
             odds["maxl"] = maxl
 
+        # No-odds model (always run)
+        X_no    = pd.DataFrame([{col: feat.get(col, np.nan) for col in feature_cols_no_odds}])
+        prob_p1_no = float(booster_no_odds.predict(X_no)[0])
+
         if odds:
             feat.update(model_mod._compute_odds_features(odds))
+            X_odds      = pd.DataFrame([{col: feat.get(col, np.nan) for col in feature_cols}])
+            prob_p1_w   = float(booster_odds.predict(X_odds)[0])
+            # Ensemble: 65% with-odds + 35% no-odds (same blend as predict_upcoming.py)
+            prob_p1     = 0.65 * prob_p1_w + 0.35 * prob_p1_no
             booster     = booster_odds
             used_cols   = feature_cols
-            model_label = "Full model (with odds)"
+            model_label = f"Ensemble (65% with-odds {prob_p1_w:.1%} + 35% no-odds {prob_p1_no:.1%})"
         else:
+            prob_p1     = prob_p1_no
             booster     = booster_no_odds
             used_cols   = feature_cols_no_odds
             model_label = "No-odds model"
 
-        X       = pd.DataFrame([{col: feat.get(col, np.nan) for col in used_cols}])
-        prob_p1 = float(booster.predict(X)[0])
         prob_p2 = 1.0 - prob_p1
+        X       = pd.DataFrame([{col: feat.get(col, np.nan) for col in used_cols}])
 
     # -----------------------------------------------------------------------
     # Section 1 — Prediction
@@ -291,8 +299,12 @@ def main():
         f2  = kelly_fraction(prob_p2, kelly_odds_p2)
         ev1 = (kelly_odds_p1 - 1) * prob_p1 - (1 - prob_p1)
         ev2 = (kelly_odds_p2 - 1) * prob_p2 - (1 - prob_p2)
-        e1  = prob_p1 - 1 / kelly_odds_p1
-        e2  = prob_p2 - 1 / kelly_odds_p2
+        # Edge vs vig-free probability (margin-removed), same as predict_upcoming.py
+        _rw, _rl = 1 / kelly_odds_p1, 1 / kelly_odds_p2
+        _tot = _rw + _rl
+        vf_p1, vf_p2 = _rw / _tot, _rl / _tot
+        e1  = prob_p1 - vf_p1
+        e2  = prob_p2 - vf_p2
 
         # Decision engine thresholds (matching backtest.py)
         MIN_EDGE_APP = 0.03
@@ -305,8 +317,8 @@ def main():
         if f1 <= 0 and f2 <= 0:
             st.warning(
                 f"**No edge on either player.** "
-                f"Model says {p1}: {prob_p1:.1%}, market implies {1/kelly_odds_p1:.1%}. "
-                f"Model says {p2}: {prob_p2:.1%}, market implies {1/kelly_odds_p2:.1%}."
+                f"Model says {p1}: {prob_p1:.1%}, Pinnacle vig-free: {vf_p1:.1%}. "
+                f"Model says {p2}: {prob_p2:.1%}, Pinnacle vig-free: {vf_p2:.1%}."
             )
         else:
             bet_player = p1 if f1 >= f2 else p2
