@@ -182,38 +182,58 @@ def _vig_free_prob(odds_w: float, odds_l: float) -> tuple[float, float]:
     return raw_w / total, raw_l / total
 
 
+def _kelly_fractions(prob: float, decimal_odds: float) -> dict:
+    """Compute full, half, and quarter Kelly fractions (floored at 0)."""
+    b = decimal_odds - 1.0
+    q = 1.0 - prob
+    full = max((b * prob - q) / b, 0.0)
+    return {"full": round(full, 4), "half": round(full / 2, 4), "quarter": round(full / 4, 4)}
+
+
 def _bet_rec(prob_p1: float, prob_p2: float, p1_odds: float | None, p2_odds: float | None,
-             p1_name: str, p2_name: str) -> tuple[str, str, str]:
-    """Apply decision engine and return (kelly_p1_str, kelly_p2_str, recommendation)."""
+             p1_name: str, p2_name: str) -> dict:
+    """Apply decision engine. Returns a dict with kelly fractions and recommendation."""
+    empty = {
+        "kelly_p1": {"full": 0.0, "half": 0.0, "quarter": 0.0},
+        "kelly_p2": {"full": 0.0, "half": 0.0, "quarter": 0.0},
+        "rec": "No odds available",
+        "qualifies": False,
+        "bet_on": None,
+        "edge": 0.0,
+    }
     if not p1_odds or not p2_odds:
-        return "—", "—", "No odds available"
+        return empty
 
-    # Edge vs vig-free probability (not raw implied — removes bookmaker margin bias)
     vf_p1, vf_p2 = _vig_free_prob(p1_odds, p2_odds)
+    e1 = prob_p1 - vf_p1
+    e2 = prob_p2 - vf_p2
 
-    def _edge(prob: float, vf: float) -> float:
-        return prob - vf
-
-    k1 = kelly(prob_p1, p1_odds)
-    k2 = kelly(prob_p2, p2_odds)
-    e1 = _edge(prob_p1, vf_p1)
-    e2 = _edge(prob_p2, vf_p2)
-
-    kelly_p1_str = f"{k1:.4f}" if k1 > 0 else "—"
-    kelly_p2_str = f"{k2:.4f}" if k2 > 0 else "—"
+    kf1 = _kelly_fractions(prob_p1, p1_odds)
+    kf2 = _kelly_fractions(prob_p2, p2_odds)
 
     def _qualifies(prob: float, odds: float, edge_val: float) -> bool:
-        return (edge_val >= MIN_EDGE and prob >= MIN_CONFIDENCE and odds >= MIN_ODDS)
+        return edge_val >= MIN_EDGE and prob >= MIN_CONFIDENCE and odds >= MIN_ODDS
 
-    if _qualifies(prob_p1, p1_odds, e1) and k1 >= k2:
-        rec = f"BET {p1_name} — QKelly {k1:.2%} of bankroll (edge vs Pinnacle {e1:+.1%})"
-    elif _qualifies(prob_p2, p2_odds, e2) and k2 > k1:
-        rec = f"BET {p2_name} — QKelly {k2:.2%} of bankroll (edge vs Pinnacle {e2:+.1%})"
+    q1 = _qualifies(prob_p1, p1_odds, e1)
+    q2 = _qualifies(prob_p2, p2_odds, e2)
+
+    if q1 and kf1["quarter"] >= kf2["quarter"]:
+        rec = (f"BET {p1_name} — "
+               f"QKelly {kf1['quarter']:.2%} | HKelly {kf1['half']:.2%} | "
+               f"FKelly {kf1['full']:.2%}  (edge vs Pinnacle {e1:+.1%})")
+        return {"kelly_p1": kf1, "kelly_p2": kf2, "rec": rec,
+                "qualifies": True, "bet_on": "p1", "edge": e1}
+    elif q2 and kf2["quarter"] > kf1["quarter"]:
+        rec = (f"BET {p2_name} — "
+               f"QKelly {kf2['quarter']:.2%} | HKelly {kf2['half']:.2%} | "
+               f"FKelly {kf2['full']:.2%}  (edge vs Pinnacle {e2:+.1%})")
+        return {"kelly_p1": kf1, "kelly_p2": kf2, "rec": rec,
+                "qualifies": True, "bet_on": "p2", "edge": e2}
     else:
         reasons = []
-        best_prob  = max(prob_p1, prob_p2)
-        best_edge  = max(e1, e2)
-        best_odds  = p1_odds if prob_p1 >= prob_p2 else p2_odds
+        best_prob = max(prob_p1, prob_p2)
+        best_edge = max(e1, e2)
+        best_odds = p1_odds if prob_p1 >= prob_p2 else p2_odds
         if best_edge < MIN_EDGE:
             reasons.append(f"edge {best_edge:+.1%} < {MIN_EDGE:.0%}")
         if best_prob < MIN_CONFIDENCE:
@@ -221,8 +241,8 @@ def _bet_rec(prob_p1: float, prob_p2: float, p1_odds: float | None, p2_odds: flo
         if best_odds < MIN_ODDS:
             reasons.append(f"odds {best_odds:.2f} < {MIN_ODDS}")
         rec = "SKIP — " + ", ".join(reasons) if reasons else "SKIP — no qualifying edge"
-
-    return kelly_p1_str, kelly_p2_str, rec
+        return {"kelly_p1": kf1, "kelly_p2": kf2, "rec": rec,
+                "qualifies": False, "bet_on": None, "edge": max(e1, e2)}
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -233,7 +253,7 @@ def main():
     parser.add_argument("--date",     type=str,   default=None, help="Filter to specific date e.g. 2026-04-30")
     parser.add_argument("--excel",    action="store_true",      help="Save output as Excel (.xlsx)")
     parser.add_argument("--no-odds",  action="store_true",      help="Skip odds API (no-odds model only)")
-    parser.add_argument("--bankroll", type=float, default=100,  help="Bankroll in $ for stake calculation (default 100)")
+    parser.add_argument("--bankroll", type=float, default=100,  help="Bankroll in $ for stake calculation (default $100)")
     args = parser.parse_args()
 
     # ── 1. Fetch upcoming matches ─────────────────────────────────────────────
@@ -357,13 +377,13 @@ def main():
         # ── Odds prediction + Kelly ───────────────────────────────────────────
         prob_p1_odds = prob_p2_odds = None
         prob_p1_ensemble = prob_p2_ensemble = None
-        kelly_p1 = kelly_p2 = "—"
         p1_dec_odds = p2_dec_odds = "—"
-        bet_rec = "No odds available"
+        b365_p1_odds = b365_p2_odds = "—"
+        bet_info = {"rec": "No odds available", "qualifies": False, "bet_on": None,
+                    "kelly_p1": {"quarter": 0.0, "half": 0.0, "full": 0.0},
+                    "kelly_p2": {"quarter": 0.0, "half": 0.0, "full": 0.0}}
 
         match_odds = _match_odds(live_odds_map, p1_raw, p2_raw) if live_odds_map else None
-
-        b365_p1_odds = b365_p2_odds = "—"
 
         if match_odds and booster_odds:
             odds_feats = model_mod._compute_odds_features({
@@ -380,16 +400,15 @@ def main():
             prob_p1_odds = float(booster_odds.predict(X_odds)[0])
             prob_p2_odds = 1.0 - prob_p1_odds
 
-            # Ensemble: blend with-odds and no-odds models (65/35 weight)
-            ENSEMBLE_W = 0.65
+            # Ensemble: 0.85 × with-odds + 0.15 × no-odds (grid-search optimal)
+            ENSEMBLE_W = 0.85
             prob_p1_ensemble = ENSEMBLE_W * prob_p1_odds + (1 - ENSEMBLE_W) * prob_p1_no
             prob_p2_ensemble = 1.0 - prob_p1_ensemble
 
             p1_dec_odds = match_odds["psw"]
             p2_dec_odds = match_odds["psl"]
 
-            # Use ensemble probability for Kelly/bet decision
-            kelly_p1, kelly_p2, bet_rec = _bet_rec(
+            bet_info = _bet_rec(
                 prob_p1_ensemble, prob_p2_ensemble, p1_dec_odds, p2_dec_odds, p1, p2
             )
 
@@ -398,54 +417,80 @@ def main():
         favourite = p1 if _fav_prob_p1 >= 0.5 else p2
         conf      = max(_fav_prob_p1, 1.0 - _fav_prob_p1)
 
-        # Dollar stake — only when we have a concrete bet recommendation
+        # Dollar stakes for all three Kelly sizes (show for bet_on side, else "—")
         bankroll = args.bankroll
-        dollar_stake = "—"
-        if kelly_p1 != "—" and "BET" in bet_rec and p1 in bet_rec:
-            dollar_stake = f"${float(kelly_p1) * bankroll:.2f}"
-        elif kelly_p2 != "—" and "BET" in bet_rec and p2 in bet_rec:
-            dollar_stake = f"${float(kelly_p2) * bankroll:.2f}"
+
+        def _stake(kf: dict, side: str) -> dict:
+            """Return dict of $ stakes for quarter/half/full kelly on the given side."""
+            if not bet_info["qualifies"] or bet_info["bet_on"] != side:
+                return {"q": "—", "h": "—", "f": "—"}
+            return {
+                "q": f"${kf['quarter'] * bankroll:.2f}",
+                "h": f"${kf['half']    * bankroll:.2f}",
+                "f": f"${kf['full']    * bankroll:.2f}",
+            }
+
+        s1 = _stake(bet_info["kelly_p1"], "p1")
+        s2 = _stake(bet_info["kelly_p2"], "p2")
+
+        # Pick the winning side's stakes for the unified stake columns
+        if bet_info["bet_on"] == "p1":
+            sq, sh, sf = s1["q"], s1["h"], s1["f"]
+        elif bet_info["bet_on"] == "p2":
+            sq, sh, sf = s2["q"], s2["h"], s2["f"]
+        else:
+            sq = sh = sf = "—"
+
+        kp1 = bet_info["kelly_p1"]
+        kp2 = bet_info["kelly_p2"]
 
         results.append({
-            "Date":                str(date),
-            "Tournament":          tourn,
-            "Round":               rnd,
-            "Surface":             surface,
-            "Player 1":            p1,
-            "Player 2":            p2,
-            "P1 Rank (live)":      int(p1_rank) if pd.notna(p1_rank) else "—",
-            "P2 Rank (live)":      int(p2_rank) if pd.notna(p2_rank) else "—",
-            "P1 Win % (no odds)":  f"{prob_p1_no:.1%}",
-            "P2 Win % (no odds)":  f"{prob_p2_no:.1%}",
-            "P1 Win % (odds)":     f"{prob_p1_odds:.1%}" if prob_p1_odds is not None else "—",
-            "P2 Win % (odds)":     f"{prob_p2_odds:.1%}" if prob_p2_odds is not None else "—",
-            "P1 Win % (ensemble)": f"{prob_p1_ensemble:.1%}" if prob_p1_ensemble is not None else "—",
-            "P2 Win % (ensemble)": f"{prob_p2_ensemble:.1%}" if prob_p2_ensemble is not None else "—",
-            "Pinnacle P1 Odds":    p1_dec_odds,
-            "Pinnacle P2 Odds":    p2_dec_odds,
-            "Bet365 P1 Odds":      b365_p1_odds,
-            "Bet365 P2 Odds":      b365_p2_odds,
-            "Kelly P1 (fraction)": kelly_p1,
-            "Kelly P2 (fraction)": kelly_p2,
-            f"$ Stake (bankroll ${bankroll:.0f})": dollar_stake,
-            "Favourite":           f"{favourite} ({conf:.1%})",
-            "Bet Recommendation":  bet_rec,
-            "Actual Winner":       "",
+            "Date":                     str(date),
+            "Tournament":               tourn,
+            "Round":                    rnd,
+            "Surface":                  surface,
+            "Player 1":                 p1,
+            "Player 2":                 p2,
+            "P1 Rank (live)":           int(p1_rank) if pd.notna(p1_rank) else "—",
+            "P2 Rank (live)":           int(p2_rank) if pd.notna(p2_rank) else "—",
+            "P1 Win % (no odds)":       f"{prob_p1_no:.1%}",
+            "P2 Win % (no odds)":       f"{prob_p2_no:.1%}",
+            "P1 Win % (odds)":          f"{prob_p1_odds:.1%}" if prob_p1_odds is not None else "—",
+            "P2 Win % (odds)":          f"{prob_p2_odds:.1%}" if prob_p2_odds is not None else "—",
+            "P1 Win % (ensemble)":      f"{prob_p1_ensemble:.1%}" if prob_p1_ensemble is not None else "—",
+            "P2 Win % (ensemble)":      f"{prob_p2_ensemble:.1%}" if prob_p2_ensemble is not None else "—",
+            "Pinnacle P1 Odds":         p1_dec_odds,
+            "Pinnacle P2 Odds":         p2_dec_odds,
+            "Bet365 P1 Odds":           b365_p1_odds,
+            "Bet365 P2 Odds":           b365_p2_odds,
+            "Full Kelly P1 (frac)":     f"{kp1['full']:.4f}"    if kp1["full"]    > 0 else "—",
+            "Half Kelly P1 (frac)":     f"{kp1['half']:.4f}"    if kp1["half"]    > 0 else "—",
+            "Qrtr Kelly P1 (frac)":     f"{kp1['quarter']:.4f}" if kp1["quarter"] > 0 else "—",
+            "Full Kelly P2 (frac)":     f"{kp2['full']:.4f}"    if kp2["full"]    > 0 else "—",
+            "Half Kelly P2 (frac)":     f"{kp2['half']:.4f}"    if kp2["half"]    > 0 else "—",
+            "Qrtr Kelly P2 (frac)":     f"{kp2['quarter']:.4f}" if kp2["quarter"] > 0 else "—",
+            f"$ Quarter Kelly (${bankroll:.0f})": sq,
+            f"$ Half Kelly    (${bankroll:.0f})": sh,
+            f"$ Full Kelly    (${bankroll:.0f})": sf,
+            "Favourite":                f"{favourite} ({conf:.1%})",
+            "Bet Recommendation":       bet_info["rec"],
+            "Actual Winner":            "",
         })
 
     # ── 6. Print results ──────────────────────────────────────────────────────
     df_out = pd.DataFrame(results)
+    br = args.bankroll
     display_cols = [
         "Date", "Tournament", "Round", "Surface",
         "Player 1", "Player 2",
         "P1 Rank (live)", "P2 Rank (live)",
-        "P1 Win % (no odds)", "P2 Win % (no odds)",
-        "P1 Win % (odds)", "P2 Win % (odds)",
         "P1 Win % (ensemble)", "P2 Win % (ensemble)",
         "Pinnacle P1 Odds", "Pinnacle P2 Odds",
-        "Bet365 P1 Odds", "Bet365 P2 Odds",
-        "Kelly P1 (fraction)", "Kelly P2 (fraction)",
-        f"$ Stake (bankroll ${args.bankroll:.0f})",
+        "Qrtr Kelly P1 (frac)", "Half Kelly P1 (frac)", "Full Kelly P1 (frac)",
+        "Qrtr Kelly P2 (frac)", "Half Kelly P2 (frac)", "Full Kelly P2 (frac)",
+        f"$ Quarter Kelly (${br:.0f})",
+        f"$ Half Kelly    (${br:.0f})",
+        f"$ Full Kelly    (${br:.0f})",
         "Favourite", "Bet Recommendation",
     ]
     display_cols = [c for c in display_cols if c in df_out.columns]
@@ -460,18 +505,28 @@ def main():
             # Bankroll summary sheet
             bankroll = args.bankroll
             bet_rows = df_out[df_out["Bet Recommendation"].str.startswith("BET", na=False)]
-            stake_col = f"$ Stake (bankroll ${bankroll:.0f})"
-            total_staked = sum(
-                float(v.replace("$", "")) for v in bet_rows[stake_col]
-                if isinstance(v, str) and v.startswith("$")
-            ) if stake_col in bet_rows.columns else 0
+
+            def _sum_col(col):
+                if col not in bet_rows.columns:
+                    return 0.0
+                return sum(float(v.replace("$", "")) for v in bet_rows[col]
+                           if isinstance(v, str) and v.startswith("$"))
+
+            qk_col = f"$ Quarter Kelly (${bankroll:.0f})"
+            hk_col = f"$ Half Kelly    (${bankroll:.0f})"
+            fk_col = f"$ Full Kelly    (${bankroll:.0f})"
+            total_q = _sum_col(qk_col)
+            total_h = _sum_col(hk_col)
+            total_f = _sum_col(fk_col)
+
             summary = pd.DataFrame([
-                {"Item": "Starting bankroll",   "Value": f"${bankroll:.2f}"},
-                {"Item": "Qualifying bets",      "Value": len(bet_rows)},
-                {"Item": "Total staked (QKelly)", "Value": f"${total_staked:.2f}"},
-                {"Item": "Remaining cash",        "Value": f"${bankroll - total_staked:.2f}"},
-                {"Item": "Rules",                 "Value": "Edge ≥ 3%, Confidence ≥ 70%, Odds ≥ 1.20"},
-                {"Item": "Kelly fraction",        "Value": "Quarter Kelly (25%)"},
+                {"Item": "Starting bankroll",          "Value": f"${bankroll:.2f}"},
+                {"Item": "Qualifying bets",             "Value": len(bet_rows)},
+                {"Item": "Total staked — Quarter Kelly","Value": f"${total_q:.2f}"},
+                {"Item": "Total staked — Half Kelly",   "Value": f"${total_h:.2f}"},
+                {"Item": "Total staked — Full Kelly",   "Value": f"${total_f:.2f}"},
+                {"Item": "Remaining (Quarter Kelly)",   "Value": f"${bankroll - total_q:.2f}"},
+                {"Item": "Rules",                       "Value": "Edge ≥ 3%, Confidence ≥ 70%, Odds ≥ 1.20"},
             ])
             summary.to_excel(writer, index=False, sheet_name="Bankroll Summary")
         print(f"\nPredictions saved → {out_path}")
