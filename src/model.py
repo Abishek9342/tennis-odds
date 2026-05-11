@@ -35,15 +35,31 @@ ODDS_COLS = {
     "max_prob_w", "max_prob_l",
 }
 
-# Confirmed zero-gain features (permutation + split + gain analysis on 2023-2024 holdout).
-# The model never uses these; removing them keeps the feature space clean and avoids
-# NaN-at-inference issues for features that are hard to populate at prediction time.
-ZERO_GAIN_COLS = {
+# Confirmed zero-gain features. Seed list is hand-curated; on each retrain
+# `train()` runs gain-importance analysis and merges any newly-zero-gain
+# features in, writing the union to `zero_gain_cols.json` for future runs.
+DEFAULT_ZERO_GAIN_COLS = {
     "round_num", "is_grand_slam", "is_best_of_5", "surface_code",
     "w_streak_5", "l_streak_5",
     "rank_pct_w", "rank_pct_l",
     "h2h_recent_2y_w", "h2h_surface_w",
 }
+
+
+def _load_zero_gain_cols(model_dir: Path | None = None) -> set[str]:
+    """Read the persisted zero-gain list, falling back to the default."""
+    if model_dir is None:
+        return set(DEFAULT_ZERO_GAIN_COLS)
+    p = model_dir / "zero_gain_cols.json"
+    if p.exists():
+        try:
+            return set(json.loads(p.read_text()))
+        except Exception:
+            pass
+    return set(DEFAULT_ZERO_GAIN_COLS)
+
+
+ZERO_GAIN_COLS = set(DEFAULT_ZERO_GAIN_COLS)  # mutated by train() if it finds more
 
 # ── Temporal split boundaries (date-based) ────────────────────────────────────
 #
@@ -224,6 +240,18 @@ def train(
     final_no.save_model(str(model_no_path))
     (out_dir / "feature_cols_no_odds.json").write_text(json.dumps(feature_cols_no))
     print(f"  Saved → {model_no_path}")
+
+    # ── Auto-detect any new zero-gain features and persist the union ─────────
+    try:
+        gains = dict(zip(feature_cols, final_booster.feature_importance(importance_type="gain")))
+        newly_zero = {f for f, g in gains.items() if g <= 0.0}
+        merged = set(DEFAULT_ZERO_GAIN_COLS) | newly_zero
+        (out_dir / "zero_gain_cols.json").write_text(json.dumps(sorted(merged)))
+        if newly_zero - set(DEFAULT_ZERO_GAIN_COLS):
+            print(f"\nAuto-detected new zero-gain features: "
+                  f"{sorted(newly_zero - set(DEFAULT_ZERO_GAIN_COLS))}")
+    except Exception as e:
+        print(f"  Warning: could not auto-update zero-gain cols ({e}).")
 
     # ── Rank → Elo calibration table (for cold-start inference) ──────────────
     print("\n── Rank→Elo cold-start calibration ─────────────────────────────")
@@ -617,3 +645,75 @@ def explain_prediction(
     })
     df["abs_shap"] = df["shap_value"].abs()
     return df.sort_values("abs_shap", ascending=False).drop(columns="abs_shap").reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Ensemble weight tuning
+# ---------------------------------------------------------------------------
+
+def tune_ensemble_weight(
+    model_dir: Path,
+    features_parquet: Path,
+    grid: list[float] | None = None,
+) -> float:
+    """Grid-search the with-odds / no-odds blend weight on the validation window.
+
+    Minimises Brier score on rows where both models can score (i.e. odds
+    features are populated). Writes the winning weight to
+    `model_dir / ensemble_weight.json` so `predict_upcoming.py` picks it up.
+    """
+    if grid is None:
+        grid = [round(0.05 * i, 2) for i in range(0, 21)]   # 0.00 .. 1.00 step 0.05
+
+    df = pd.read_parquet(features_parquet)
+    df["date"] = pd.to_datetime(df["date"])
+    val = df[(df["date"] >= VAL_START) & (df["date"] <= VAL_END)].copy()
+    if val.empty:
+        print("No validation window data — cannot tune ensemble weight.")
+        return 0.65
+
+    cols_full = json.loads((model_dir / "feature_cols.json").read_text())
+    cols_no   = json.loads((model_dir / "feature_cols_no_odds.json").read_text())
+
+    booster_full = lgb.Booster(model_file=str(model_dir / "model.lgb"))
+    booster_no   = lgb.Booster(model_file=str(model_dir / "model_no_odds.lgb"))
+
+    # Only rows where odds features exist for a fair comparison
+    odds_anchor = "pin_prob_w"
+    if odds_anchor in val.columns:
+        val_odds_ok = val[val[odds_anchor].notna()].copy()
+    else:
+        val_odds_ok = val.copy()
+
+    if val_odds_ok.empty:
+        print("No rows with odds in validation window.")
+        return 0.65
+
+    X_full = val_odds_ok[cols_full].astype(float)
+    X_no   = val_odds_ok[cols_no].astype(float)
+    y      = val_odds_ok["label"].astype(int).values
+
+    p_full = booster_full.predict(X_full)
+    p_no   = booster_no.predict(X_no)
+
+    best_w, best_brier = 0.5, float("inf")
+    print(f"\nGrid-searching ensemble weight over {len(grid)} values on "
+          f"{len(val_odds_ok):,} validation rows...")
+    for w in grid:
+        p = w * p_full + (1.0 - w) * p_no
+        b = brier_score_loss(y, p)
+        marker = ""
+        if b < best_brier:
+            best_brier = b
+            best_w     = w
+            marker     = "  ← best"
+        print(f"  w={w:.2f}  Brier={b:.5f}  AUC={roc_auc_score(y, p):.4f}{marker}")
+
+    model_dir.mkdir(parents=True, exist_ok=True)
+    (model_dir / "ensemble_weight.json").write_text(
+        json.dumps({"weight_odds": best_w, "brier": best_brier,
+                    "val_rows": int(len(val_odds_ok))}, indent=2)
+    )
+    print(f"\nOptimal weight_odds = {best_w:.2f} (Brier {best_brier:.5f}) "
+          f"→ saved {model_dir / 'ensemble_weight.json'}")
+    return best_w

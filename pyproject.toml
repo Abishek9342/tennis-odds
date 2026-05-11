@@ -20,4 +20,7 @@ dependencies = [
     "plotly>=5.0",
     "python-dotenv>=1.2.2",
     "playwright>=1.59.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.32",
+    "pydantic>=2.0",
 ]

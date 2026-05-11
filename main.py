@@ -22,7 +22,7 @@ MODEL_DIR = DATA_DIR / "processed" / "models"
 
 def cmd_scrape(args):
     import scraper
-    paths = scraper.download_all(DATA_DIR, force=args.force)
+    paths = scraper.download_all(DATA_DIR, force=args.force, tour=args.tour)
     if args.years:
         paths = [p for p in paths if int(p.stem.split("_")[0]) in args.years]
     scraper.load_and_normalise(paths, out=RAW_PARQUET)
@@ -35,8 +35,27 @@ def cmd_features(args):
 
 def cmd_train(args):
     import model
-    # holdout_years=[] means production mode (include test period in training)
-    holdout_years = [] if args.production else None
+    # holdout_years=[] means production mode (include test period in training).
+    # Guarded by an explicit confirm token + interactive prompt so a stray
+    # --production flag cannot quietly contaminate evaluation metrics.
+    holdout_years = None
+    if args.production:
+        token_ok = args.confirm_test_leak == "YES_LEAK_TEST_INTO_TRAINING"
+        if not token_ok:
+            raise SystemExit(
+                "--production requested but the safety token is missing.\n"
+                "This mode trains on the test holdout. Any evaluation afterwards is invalid.\n"
+                "If you are sure, re-run with:\n"
+                "  --production --confirm-test-leak YES_LEAK_TEST_INTO_TRAINING"
+            )
+        # Tag the artifact so anyone inspecting the model dir knows it was
+        # trained including the test holdout and cannot be evaluated honestly.
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        (MODEL_DIR / "PRODUCTION_TRAINED_ON_TEST.flag").write_text(
+            "This model was trained including the test holdout period.\n"
+            "Do NOT report evaluation metrics from `python main.py evaluate` against this model.\n"
+        )
+        holdout_years = []
     model.train(
         features_parquet=Path(args.features),
         out_dir=MODEL_DIR,
@@ -47,10 +66,39 @@ def cmd_train(args):
 
 def cmd_evaluate(args):
     import model
+    # Refuse to evaluate a production-tainted model — the result is meaningless.
+    flag = MODEL_DIR / "PRODUCTION_TRAINED_ON_TEST.flag"
+    if flag.exists():
+        raise SystemExit(
+            f"Refusing to evaluate: {flag} exists. This model was trained on the test\n"
+            "holdout (--production). Retrain without --production to get honest OOS metrics."
+        )
     model.evaluate(
         model_dir=MODEL_DIR,
         features_parquet=FEATURES_PARQUET,
     )
+
+
+def cmd_tune_ensemble(args):
+    import model
+    model.tune_ensemble_weight(
+        model_dir=MODEL_DIR,
+        features_parquet=Path(args.features),
+    )
+
+
+def cmd_calibrate(args):
+    import calibration
+    calibration.fit_and_save(
+        model_dir=MODEL_DIR,
+        features_parquet=Path(args.features),
+        method=args.method,
+    )
+
+
+def cmd_sanity(args):
+    import sanity_check
+    sys.exit(0 if sanity_check.run() else 1)
 
 
 def cmd_predict(args):
@@ -94,6 +142,8 @@ def main():
     p_scrape = sub.add_parser("scrape", help="Download raw ATP data files")
     p_scrape.add_argument("--years", type=int, nargs="+", help="Filter to specific years")
     p_scrape.add_argument("--force", action="store_true", help="Re-download existing files")
+    p_scrape.add_argument("--tour",  choices=["atp", "wta", "challenger", "all"], default="atp",
+                          help="Which tour to scrape (default: atp)")
 
     # features
     p_feat = sub.add_parser("features", help="Build feature matrix from raw data")
@@ -112,6 +162,10 @@ def main():
     p_train.add_argument(
         "--production", action="store_true", default=False,
         help="Train on ALL data including test period (production deployment only).",
+    )
+    p_train.add_argument(
+        "--confirm-test-leak", type=str, default="",
+        help="Required safety token when --production is passed. Must equal YES_LEAK_TEST_INTO_TRAINING.",
     )
 
     # evaluate
@@ -140,14 +194,30 @@ def main():
     p_ens.add_argument("--psw",   type=float, default=None, help="Pinnacle P1 odds")
     p_ens.add_argument("--psl",   type=float, default=None, help="Pinnacle P2 odds")
 
+    # tune-ensemble
+    p_tune = sub.add_parser("tune-ensemble",
+                             help="Grid-search the optimal with-odds/no-odds weight on the validation period.")
+    p_tune.add_argument("--features", default=str(FEATURES_PARQUET))
+
+    # calibrate
+    p_cal = sub.add_parser("calibrate", help="Fit a probability calibrator (Platt or isotonic) on the val window.")
+    p_cal.add_argument("--features", default=str(FEATURES_PARQUET))
+    p_cal.add_argument("--method", choices=["platt", "isotonic"], default="isotonic")
+
+    # sanity check
+    sub.add_parser("sanity", help="End-to-end smoke test (model load + single prediction).")
+
     args = parser.parse_args()
     {
-        "scrape":   cmd_scrape,
-        "features": cmd_features,
-        "train":    cmd_train,
-        "evaluate": cmd_evaluate,
-        "predict":  cmd_predict,
-        "ensemble": cmd_ensemble,
+        "scrape":        cmd_scrape,
+        "features":      cmd_features,
+        "train":         cmd_train,
+        "evaluate":      cmd_evaluate,
+        "predict":       cmd_predict,
+        "ensemble":      cmd_ensemble,
+        "tune-ensemble": cmd_tune_ensemble,
+        "calibrate":     cmd_calibrate,
+        "sanity":        cmd_sanity,
     }[args.command](args)
 
 

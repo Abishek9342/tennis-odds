@@ -59,8 +59,18 @@ KEEP_COLS = [
 ]
 
 
-def discover_urls(base: str = BASE_URL) -> list[tuple[int, str]]:
-    """Fetch alldata.php and return [(year, url)] for ATP files only, oldest first."""
+def discover_urls(base: str = BASE_URL, tour: str = "atp") -> list[tuple[int, str]]:
+    """Fetch alldata.php and return [(year, url)] for the chosen tour, oldest first.
+
+    tour:
+        "atp"        – top tour only (default)
+        "wta"        – women's tour
+        "challenger" – ATP Challenger series (if hosted)
+        "all"        – every available file; year is the calendar year integer
+
+    Tennis-data.co.uk encodes WTA files in `{year}w/` directories.
+    Challenger files (where available) live under `cha{year}/` style dirs.
+    """
     resp = requests.get(
         f"{base}/alldata.php",
         headers={"User-Agent": "Mozilla/5.0 (research/data-collection)"},
@@ -72,20 +82,28 @@ def discover_urls(base: str = BASE_URL) -> list[tuple[int, str]]:
     results = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        # ATP files: "{year}/{year}.xls(x)" — WTA files have "w" suffix in dir
         if not (href.endswith(".xls") or href.endswith(".xlsx")):
             continue
         parts = href.split("/")
         if len(parts) != 2:
             continue
         year_dir = parts[0]
-        # Skip WTA (directories end with 'w', e.g. "2024w")
-        if year_dir.endswith("w"):
-            continue
+
+        is_wta        = year_dir.endswith("w")
+        is_challenger = year_dir.startswith("cha")
         try:
-            year = int(year_dir)
+            year = int("".join(c for c in year_dir if c.isdigit()))
         except ValueError:
             continue
+
+        if tour == "atp" and (is_wta or is_challenger):
+            continue
+        if tour == "wta" and not is_wta:
+            continue
+        if tour == "challenger" and not is_challenger:
+            continue
+        # "all" accepts everything
+
         full_url = f"{base}/{href}"
         results.append((year, full_url))
 
@@ -93,12 +111,12 @@ def discover_urls(base: str = BASE_URL) -> list[tuple[int, str]]:
     return results
 
 
-def download_all(dest: Path, force: bool = False) -> list[Path]:
-    """Download all ATP files into dest/raw/, skipping existing files."""
-    raw_dir = dest / "raw"
+def download_all(dest: Path, force: bool = False, tour: str = "atp") -> list[Path]:
+    """Download tour files into dest/raw/, skipping existing files."""
+    raw_dir = dest / "raw" / tour
     raw_dir.mkdir(parents=True, exist_ok=True)
 
-    urls = discover_urls()
+    urls = discover_urls(tour=tour)
     paths = []
 
     session = requests.Session()

@@ -127,22 +127,25 @@ class _PlayerTracker:
             win_rate_surf_by_window[n] = wrs
 
         # --- Momentum: win_rate_10d / win_rate_90d ---
+        # Prior = 1.0 (neutral momentum) when either window is empty. Using NaN
+        # collides with LightGBM's default-NaN-direction tree branches and
+        # causes train/inference drift since rookies fall into a different bin.
         wr10 = win_rate_by_window.get(10, np.nan)
         wr90 = win_rate_by_window.get(90, np.nan)
-        rec["momentum"] = wr10 / wr90 if (pd.notna(wr10) and pd.notna(wr90) and wr90 > 0) else np.nan
+        rec["momentum"] = wr10 / wr90 if (pd.notna(wr10) and pd.notna(wr90) and wr90 > 0) else 1.0
 
-        # --- Win rate trend: 30d − 90d ---
+        # --- Win rate trend: 30d − 90d --- (prior 0.0 = no trend)
         wr30 = win_rate_by_window.get(30, np.nan)
-        rec["win_rate_trend"] = (wr30 - wr90) if (pd.notna(wr30) and pd.notna(wr90)) else np.nan
+        rec["win_rate_trend"] = (wr30 - wr90) if (pd.notna(wr30) and pd.notna(wr90)) else 0.0
 
-        # --- Consistency: std dev of recent binary results ---
+        # --- Consistency: std dev of recent binary results --- (prior 0.5 = max binary stddev)
         cutoff30 = date - pd.Timedelta(days=30)
         recent30 = [e for e in history if e[0] >= cutoff30]
         if len(recent30) >= 3:
             results = [float(e[2]) for e in recent30]
             rec["consistency_30d"] = float(np.std(results))
         else:
-            rec["consistency_30d"] = np.nan
+            rec["consistency_30d"] = 0.5
 
         # --- Surface affinity: surf win rate − overall win rate ---
         wrs30 = win_rate_surf_by_window.get(30, np.nan)
@@ -531,7 +534,10 @@ def build_features(raw_parquet: Path, out: Path,
         if "b365_vs_pin" in row.index and pd.notna(row["b365_vs_pin"]):
             row["b365_vs_pin"] = -src["b365_vs_pin"]
 
-        # Flip H2H directional columns
+        # Flip H2H directional columns. h2h_*_w is winner-perspective. For
+        # label=0 rows p1=loser, so 1.0 - val converts to p1-perspective. At
+        # inference get_live_features() queries h2h directly from p1's
+        # perspective, so the training and inference distributions match.
         for col in h2h_flip_cols:
             if col in row.index:
                 val = src[col]

@@ -30,6 +30,20 @@ MIN_CONFIDENCE  = 0.70   # model probability must be ≥ 70%
 MIN_ODDS        = 1.20   # avoid very short-priced favourites
 KELLY_FRACTION  = 0.25   # quarter Kelly (recommended)
 
+# Ensemble weight: with-odds vs no-odds. Reads from ensemble_weight.json if a
+# grid-search has tuned it; otherwise falls back to the default the model was
+# validated at. Keep this consistent with src/model.py predict_ensemble().
+DEFAULT_ENSEMBLE_W = 0.65
+
+def _load_ensemble_weight() -> float:
+    path = MODEL_DIR / "ensemble_weight.json"
+    if path.exists():
+        try:
+            return float(json.loads(path.read_text()).get("weight_odds", DEFAULT_ENSEMBLE_W))
+        except Exception:
+            pass
+    return DEFAULT_ENSEMBLE_W
+
 SURFACE_MAP = {
     "red clay":    "Clay",
     "clay":        "Clay",
@@ -69,17 +83,21 @@ def strip_accents(text: str) -> str:
 
 # ── Live Rankings ────────────────────────────────────────────────────────────
 
-def fetch_live_ranks(known: list[str], top_n: int = 200) -> dict[str, int]:
-    """Return {internal_name: live_rank} using match_to_internal for reliable name resolution."""
+def fetch_live_ranks(known: list[str], top_n: int = 200) -> tuple[dict[str, int], bool]:
+    """Return ({internal_name: live_rank}, live_ok). live_ok is False if the
+    fetch failed and the caller will be using stale historical ranks."""
     from atp_scraper import get_live_rank_map
     try:
         print("Fetching live ATP rankings...")
         rank_map = get_live_rank_map(known, top_n=top_n)
         print(f"  Got {len(rank_map)} live ranks.")
-        return rank_map
+        if not rank_map:
+            print("  ⚠️  WARNING: live ranking API returned 0 players — predictions will use stale historical ranks.")
+            return {}, False
+        return rank_map, True
     except Exception as e:
-        print(f"  Warning: could not fetch live rankings ({e}). Using historical data.")
-        return {}
+        print(f"  ⚠️  WARNING: live rankings fetch FAILED ({e}). Predictions will use stale historical ranks.")
+        return {}, False
 
 
 # ── Odds API ─────────────────────────────────────────────────────────────────
@@ -254,6 +272,10 @@ def main():
     parser.add_argument("--excel",    action="store_true",      help="Save output as Excel (.xlsx)")
     parser.add_argument("--no-odds",  action="store_true",      help="Skip odds API (no-odds model only)")
     parser.add_argument("--bankroll", type=float, default=100,  help="Bankroll in $ for stake calculation (default $100)")
+    parser.add_argument("--allow-stale-ranks", action="store_true",
+                        help="Proceed even if live ATP rank fetch fails (uses historical ranks).")
+    parser.add_argument("--log-unknown", type=str, default="logs/unknown_players.csv",
+                        help="CSV file to append unknown-player encounters to.")
     args = parser.parse_args()
 
     # ── 1. Fetch upcoming matches ─────────────────────────────────────────────
@@ -313,15 +335,38 @@ def main():
     print("Model loaded.\n")
 
     # ── 3. Live rankings ──────────────────────────────────────────────────────
-    live_ranks = fetch_live_ranks(known)
+    live_ranks, live_ranks_ok = fetch_live_ranks(known)
+    if not live_ranks_ok and not args.allow_stale_ranks:
+        print("\nAborting: refusing to predict with stale historical ranks. "
+              "Pass --allow-stale-ranks to override (predictions will be marked).")
+        return
 
     # ── 4. Live odds ──────────────────────────────────────────────────────────
-    api_key = os.getenv("ODDS_API_KEY", "9fa97db9dc2ab4251273aea368c1e457")
+    api_key = os.getenv("ODDS_API_KEY", "")
     live_odds_map: dict = {}
-    if not args.no_odds and api_key:
-        print("Fetching live odds from The Odds API...")
-        live_odds_map = fetch_live_odds(api_key)
-        print()
+    if not args.no_odds:
+        if not api_key:
+            print("ODDS_API_KEY not set — skipping live odds (no-odds model only).")
+        else:
+            print("Fetching live odds from The Odds API...")
+            live_odds_map = fetch_live_odds(api_key)
+            print()
+
+    # ── 4b. Ensemble weight + optional probability calibrator ────────────────
+    ENSEMBLE_W = _load_ensemble_weight()
+    print(f"Ensemble weight (with-odds): {ENSEMBLE_W:.3f}")
+    calibrator = None
+    cal_path = MODEL_DIR / "calibrator.json"
+    if cal_path.exists():
+        try:
+            from calibration import load_calibrator
+            calibrator = load_calibrator(cal_path)
+            print(f"Loaded probability calibrator: {cal_path.name}")
+        except Exception as e:
+            print(f"  Warning: could not load calibrator ({e}); using raw probabilities.")
+
+    # Track players we couldn't resolve so user knows coverage gaps
+    unknown_players: list[tuple[str, str]] = []
 
     # ── 5. Predict each match ─────────────────────────────────────────────────
     results = []
@@ -339,6 +384,8 @@ def main():
 
         if p1 is None or p2 is None:
             unknown = [x for x, y in [(p1_raw, p1), (p2_raw, p2)] if y is None]
+            for u in unknown:
+                unknown_players.append((str(date), u))
             results.append({
                 "Date": str(date), "Tournament": tourn, "Round": rnd, "Surface": surface,
                 "Player 1": p1_raw, "Player 2": p2_raw,
@@ -400,9 +447,11 @@ def main():
             prob_p1_odds = float(booster_odds.predict(X_odds)[0])
             prob_p2_odds = 1.0 - prob_p1_odds
 
-            # Ensemble: 0.85 × with-odds + 0.15 × no-odds (grid-search optimal)
-            ENSEMBLE_W = 0.85
+            # Ensemble blend. Weight is read from ensemble_weight.json (auto-tuned
+            # by `python main.py tune-ensemble`), defaulting to DEFAULT_ENSEMBLE_W.
             prob_p1_ensemble = ENSEMBLE_W * prob_p1_odds + (1 - ENSEMBLE_W) * prob_p1_no
+            if calibrator is not None:
+                prob_p1_ensemble = float(calibrator.transform([prob_p1_ensemble])[0])
             prob_p2_ensemble = 1.0 - prob_p1_ensemble
 
             p1_dec_odds = match_odds["psw"]
@@ -411,6 +460,17 @@ def main():
             bet_info = _bet_rec(
                 prob_p1_ensemble, prob_p2_ensemble, p1_dec_odds, p2_dec_odds, p1, p2
             )
+
+            # CLV: stamp the opening Pinnacle price the moment we recommend a bet.
+            # Later, `python -m clv_close` (run near match start) records the
+            # closing price and computes CLV.
+            if bet_info["qualifies"]:
+                try:
+                    import clv
+                    clv.record_open(p1, p2, prob_p1_ensemble,
+                                    p1_dec_odds, p2_dec_odds, date=date)
+                except Exception as e:
+                    print(f"  Warning: CLV open-record failed: {e}")
 
         # Favourite: use ensemble when available, else no-odds
         _fav_prob_p1 = prob_p1_ensemble if prob_p1_ensemble is not None else prob_p1_no
@@ -542,6 +602,17 @@ def main():
         print(f"\nPredictions saved → {out_path}")
 
     print("\nFill in the 'Actual Winner' column after matches finish to track accuracy.")
+
+    # ── 8. Append unknown-player encounters to log ───────────────────────────
+    if unknown_players:
+        log_path = Path(args.log_unknown)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_df = pd.DataFrame(unknown_players, columns=["date", "raw_name"])
+        if log_path.exists():
+            log_df = pd.concat([pd.read_csv(log_path), log_df], ignore_index=True)
+            log_df = log_df.drop_duplicates(subset=["date", "raw_name"], keep="first")
+        log_df.to_csv(log_path, index=False)
+        print(f"\n⚠️  {len(unknown_players)} unknown player encounter(s) appended to {log_path}")
 
 
 if __name__ == "__main__":
