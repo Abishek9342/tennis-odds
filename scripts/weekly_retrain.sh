@@ -23,10 +23,11 @@ LOG="$LOG_DIR/retrain_${TS}.log"
 
 echo "[$(date)] Weekly retrain starting" | tee -a "$LOG"
 
-uv run python main.py scrape      2>&1 | tee -a "$LOG"
-uv run python main.py features    2>&1 | tee -a "$LOG"
-uv run python main.py train       2>&1 | tee -a "$LOG"
-uv run python main.py tune-ensemble 2>&1 | tee -a "$LOG"
+uv run python main.py scrape           2>&1 | tee -a "$LOG"
+uv run python main.py features         2>&1 | tee -a "$LOG"
+uv run python main.py train            2>&1 | tee -a "$LOG"
+uv run python main.py tune-ensemble    2>&1 | tee -a "$LOG"
+uv run python main.py tune-thresholds  2>&1 | tee -a "$LOG"
 uv run python main.py calibrate --method isotonic 2>&1 | tee -a "$LOG"
 
 echo "[$(date)] Running sanity check" | tee -a "$LOG"

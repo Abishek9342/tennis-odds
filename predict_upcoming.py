@@ -24,11 +24,28 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 DATA_DIR  = Path("data/processed")
 MODEL_DIR = DATA_DIR / "models"
 
-# Betting decision engine thresholds
-MIN_EDGE        = 0.03   # must have ≥ 3% edge over implied prob
+# Betting decision engine thresholds — overridden at startup from
+# bet_thresholds.json if present (produced by `python main.py tune-thresholds`).
+# Key finding from test-holdout backtest: MIN_ODDS=1.40 is the primary filter;
+# below 1.40 the market is too efficient and Pinnacle vig eats any edge.
+MIN_EDGE        = 0.03   # must have ≥ 3% edge over vig-free Pinnacle prob
 MIN_CONFIDENCE  = 0.70   # model probability must be ≥ 70%
-MIN_ODDS        = 1.20   # avoid very short-priced favourites
-KELLY_FRACTION  = 0.25   # quarter Kelly (recommended)
+MIN_ODDS        = 1.40   # ← was 1.20; below 1.40 ROI is consistently negative
+KELLY_FRACTION  = 0.25   # quarter Kelly (conservative, recommended for live use)
+
+
+def _load_thresholds() -> tuple[float, float, float]:
+    """Read MIN_EDGE/MIN_CONFIDENCE/MIN_ODDS from bet_thresholds.json if available."""
+    path = MODEL_DIR / "bet_thresholds.json"
+    if path.exists():
+        try:
+            t = json.loads(path.read_text())
+            return (float(t.get("min_edge",      MIN_EDGE)),
+                    float(t.get("min_conf",       MIN_CONFIDENCE)),
+                    float(t.get("min_odds",       MIN_ODDS)))
+        except Exception:
+            pass
+    return MIN_EDGE, MIN_CONFIDENCE, MIN_ODDS
 
 # Ensemble weight: with-odds vs no-odds. Reads from ensemble_weight.json if a
 # grid-search has tuned it; otherwise falls back to the default the model was
@@ -235,18 +252,26 @@ def _bet_rec(prob_p1: float, prob_p2: float, p1_odds: float | None, p2_odds: flo
     q1 = _qualifies(prob_p1, p1_odds, e1)
     q2 = _qualifies(prob_p2, p2_odds, e2)
 
+    # Break-even win rate: the minimum win% needed to profit at these odds
+    be1 = 1.0 / p1_odds if p1_odds > 0 else 1.0
+    be2 = 1.0 / p2_odds if p2_odds > 0 else 1.0
+
     if q1 and kf1["quarter"] >= kf2["quarter"]:
+        margin1 = prob_p1 - be1
         rec = (f"BET {p1_name} — "
                f"QKelly {kf1['quarter']:.2%} | HKelly {kf1['half']:.2%} | "
-               f"FKelly {kf1['full']:.2%}  (edge vs Pinnacle {e1:+.1%})")
+               f"FKelly {kf1['full']:.2%}  "
+               f"(edge vs Pinnacle {e1:+.1%} | margin over break-even {margin1:+.1%})")
         return {"kelly_p1": kf1, "kelly_p2": kf2, "rec": rec,
-                "qualifies": True, "bet_on": "p1", "edge": e1}
+                "qualifies": True, "bet_on": "p1", "edge": e1, "break_even": be1}
     elif q2 and kf2["quarter"] > kf1["quarter"]:
+        margin2 = prob_p2 - be2
         rec = (f"BET {p2_name} — "
                f"QKelly {kf2['quarter']:.2%} | HKelly {kf2['half']:.2%} | "
-               f"FKelly {kf2['full']:.2%}  (edge vs Pinnacle {e2:+.1%})")
+               f"FKelly {kf2['full']:.2%}  "
+               f"(edge vs Pinnacle {e2:+.1%} | margin over break-even {margin2:+.1%})")
         return {"kelly_p1": kf1, "kelly_p2": kf2, "rec": rec,
-                "qualifies": True, "bet_on": "p2", "edge": e2}
+                "qualifies": True, "bet_on": "p2", "edge": e2, "break_even": be2}
     else:
         reasons = []
         best_prob = max(prob_p1, prob_p2)
@@ -257,10 +282,10 @@ def _bet_rec(prob_p1: float, prob_p2: float, p1_odds: float | None, p2_odds: flo
         if best_prob < MIN_CONFIDENCE:
             reasons.append(f"conf {best_prob:.1%} < {MIN_CONFIDENCE:.0%}")
         if best_odds < MIN_ODDS:
-            reasons.append(f"odds {best_odds:.2f} < {MIN_ODDS}")
+            reasons.append(f"odds {best_odds:.2f} < {MIN_ODDS:.2f} (short-price filter)")
         rec = "SKIP — " + ", ".join(reasons) if reasons else "SKIP — no qualifying edge"
         return {"kelly_p1": kf1, "kelly_p2": kf2, "rec": rec,
-                "qualifies": False, "bet_on": None, "edge": max(e1, e2)}
+                "qualifies": False, "bet_on": None, "edge": max(e1, e2), "break_even": None}
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -352,9 +377,14 @@ def main():
             live_odds_map = fetch_live_odds(api_key)
             print()
 
-    # ── 4b. Ensemble weight + optional probability calibrator ────────────────
+    # ── 4b. Ensemble weight, thresholds + optional probability calibrator ─────
     ENSEMBLE_W = _load_ensemble_weight()
+    _edge, _conf, _odds = _load_thresholds()
+    # Override module-level constants so _bet_rec() picks them up
+    global MIN_EDGE, MIN_CONFIDENCE, MIN_ODDS
+    MIN_EDGE, MIN_CONFIDENCE, MIN_ODDS = _edge, _conf, _odds
     print(f"Ensemble weight (with-odds): {ENSEMBLE_W:.3f}")
+    print(f"Thresholds: edge≥{MIN_EDGE:.0%}  conf≥{MIN_CONFIDENCE:.0%}  odds≥{MIN_ODDS:.2f}")
     calibrator = None
     cal_path = MODEL_DIR / "calibrator.json"
     if cal_path.exists():

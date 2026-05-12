@@ -87,6 +87,15 @@ def cmd_tune_ensemble(args):
     )
 
 
+def cmd_tune_thresholds(args):
+    import model
+    model.tune_thresholds(
+        model_dir=MODEL_DIR,
+        features_parquet=Path(args.features),
+        use_val=not args.use_test,
+    )
+
+
 def cmd_calibrate(args):
     import calibration
     calibration.fit_and_save(
@@ -199,6 +208,13 @@ def main():
                              help="Grid-search the optimal with-odds/no-odds weight on the validation period.")
     p_tune.add_argument("--features", default=str(FEATURES_PARQUET))
 
+    # tune-thresholds
+    p_thr = sub.add_parser("tune-thresholds",
+                            help="Grid-search optimal MIN_EDGE/MIN_CONFIDENCE/MIN_ODDS on val window.")
+    p_thr.add_argument("--features", default=str(FEATURES_PARQUET))
+    p_thr.add_argument("--use-test", action="store_true",
+                       help="Evaluate on test holdout instead of val (use only once, final check).")
+
     # calibrate
     p_cal = sub.add_parser("calibrate", help="Fit a probability calibrator (Platt or isotonic) on the val window.")
     p_cal.add_argument("--features", default=str(FEATURES_PARQUET))
@@ -215,8 +231,9 @@ def main():
         "evaluate":      cmd_evaluate,
         "predict":       cmd_predict,
         "ensemble":      cmd_ensemble,
-        "tune-ensemble": cmd_tune_ensemble,
-        "calibrate":     cmd_calibrate,
+        "tune-ensemble":    cmd_tune_ensemble,
+        "tune-thresholds":  cmd_tune_thresholds,
+        "calibrate":        cmd_calibrate,
         "sanity":        cmd_sanity,
     }[args.command](args)
 

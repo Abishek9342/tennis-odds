@@ -717,3 +717,102 @@ def tune_ensemble_weight(
     print(f"\nOptimal weight_odds = {best_w:.2f} (Brier {best_brier:.5f}) "
           f"→ saved {model_dir / 'ensemble_weight.json'}")
     return best_w
+
+
+# ---------------------------------------------------------------------------
+# Threshold tuning
+# ---------------------------------------------------------------------------
+
+def tune_thresholds(
+    model_dir: Path,
+    features_parquet: Path,
+    use_val: bool = True,
+) -> dict:
+    """Grid-search optimal MIN_EDGE / MIN_CONFIDENCE / MIN_ODDS on the val window.
+
+    Uses val window (2024-01-01→2025-06-30) by default so the test holdout
+    stays clean.  Set use_val=False to evaluate on the test holdout for a
+    final one-time check.
+
+    Saves optimal thresholds to model_dir/bet_thresholds.json.
+    """
+    df = pd.read_parquet(features_parquet)
+    df["date"] = pd.to_datetime(df["date"])
+
+    if use_val:
+        sub_df = df[(df["date"] >= VAL_START) & (df["date"] <= VAL_END)].copy()
+        label = "validation"
+    else:
+        sub_df = df[(df["date"] >= TEST_START) & (df["date"] <= TEST_END)].copy()
+        label = "test-holdout"
+
+    if sub_df.empty:
+        print(f"No data in {label} window.")
+        return {}
+
+    cols_full = json.loads((model_dir / "feature_cols.json").read_text())
+    booster   = lgb.Booster(model_file=str(model_dir / "model.lgb"))
+
+    cal_path = model_dir / "calibrator.json"
+    cal = None
+    if cal_path.exists():
+        import sys, importlib
+        sys.path.insert(0, str(model_dir.parent.parent / "src"))
+        from calibration import load_calibrator
+        cal = load_calibrator(cal_path)
+
+    probs = booster.predict(sub_df[cols_full].astype(float))
+    if cal:
+        probs = cal.transform(probs)
+
+    sub_df = sub_df.copy()
+    sub_df["prob_p1"] = probs
+    has_odds = sub_df["pin_prob_w"].notna() & (sub_df["pin_prob_w"] > 0)
+    sub_df = sub_df[has_odds].copy()
+    sub_df["vf_p1"]   = sub_df["pin_prob_w"]
+    sub_df["vf_odds"] = 1.0 / sub_df["pin_prob_w"]
+    # Approximate real Pinnacle odds (2.4% vig back-out)
+    sub_df["real_odds"] = sub_df["vf_odds"] * (1.0 - 0.024)
+    sub_df["edge"]      = sub_df["prob_p1"] - sub_df["vf_p1"]
+
+    best: dict = {}
+    print(f"\nTuning thresholds on {label} ({len(sub_df):,} rows with odds)…")
+    print(f"{'Edge':>6} {'Conf':>6} {'MinOdds':>8} | {'Bets':>5} {'WinR':>6} {'FlatROI':>9} {'KellyROI':>10}")
+    print("-" * 65)
+
+    for min_edge in [0.02, 0.03, 0.04, 0.05, 0.06]:
+        for min_conf in [0.60, 0.65, 0.70, 0.75]:
+            for min_odds in [1.20, 1.30, 1.40, 1.50, 1.60]:
+                bets = sub_df[
+                    (sub_df["prob_p1"] >= min_conf) &
+                    (sub_df["edge"]    >= min_edge) &
+                    (sub_df["vf_odds"] >= min_odds)
+                ].copy()
+                if len(bets) < 20:
+                    continue
+                won  = bets["label"] == 1
+                pnl  = np.where(won, bets["real_odds"] - 1.0, -1.0)
+                roi  = pnl.mean() * 100
+                b    = bets["real_odds"] - 1.0
+                k_q  = ((b * bets["prob_p1"] - (1 - bets["prob_p1"])) / b).clip(lower=0) * 0.25
+                pnl_k = np.where(won, b * k_q, -k_q)
+                roi_k = pnl_k.sum() / k_q.sum() * 100 if k_q.sum() > 0 else 0
+                marker = ""
+                if not best or roi_k > best.get("roi_kelly", -999):
+                    best = {"min_edge": min_edge, "min_conf": min_conf,
+                            "min_odds": min_odds, "n": len(bets),
+                            "winrate": float(won.mean()), "roi_flat": roi,
+                            "roi_kelly": roi_k}
+                    marker = "  ← best"
+                print(f"{min_edge:>6.0%} {min_conf:>6.0%} {min_odds:>8.2f} | "
+                      f"{len(bets):>5} {won.mean():>6.1%} "
+                      f"{roi:>+9.2f}% {roi_k:>+10.2f}%{marker}")
+
+    if best:
+        out = model_dir / "bet_thresholds.json"
+        out.write_text(json.dumps(best, indent=2))
+        print(f"\nOptimal: edge≥{best['min_edge']:.0%}  conf≥{best['min_conf']:.0%}  "
+              f"odds≥{best['min_odds']:.2f}  "
+              f"→ {best['n']} bets  flat {best['roi_flat']:+.2f}%  kelly {best['roi_kelly']:+.2f}%")
+        print(f"Saved → {out}")
+    return best

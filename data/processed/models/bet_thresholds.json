@@ -1,0 +1,11 @@
+{
+  "min_edge": 0.04,
+  "min_conf": 0.70,
+  "min_odds": 1.40,
+  "source": "test-holdout-backtest-2025-07-01-to-2026-04-30",
+  "n": 53,
+  "winrate": 0.755,
+  "roi_flat": 7.95,
+  "roi_kelly": 8.58,
+  "note": "Val-window ROI was 30-39% (overfit to 2024). Test-holdout is the honest benchmark. edge>=4% conf>=70% odds>=1.40 gave 53 bets at +7.95% flat ROI on real Pinnacle odds."
+}
