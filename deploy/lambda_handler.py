@@ -87,8 +87,25 @@ def handler_predict(event, context):
     _sync_from_s3()
     _patch_paths()
 
+    # Ensure writable output directories exist under /tmp
+    (TMP / "out").mkdir(parents=True, exist_ok=True)
+    (TMP / "logs").mkdir(parents=True, exist_ok=True)
+
+    # Pull existing CSVs from S3 so history accumulates across container restarts
+    import boto3
+    s3 = boto3.client("s3")
+    for s3_key, local_path in [
+        ("out/predictions_log.csv",  TMP / "out/predictions_log.csv"),
+        ("logs/paper_trades.csv",    TMP / "logs/paper_trades.csv"),
+    ]:
+        if not local_path.exists():
+            try:
+                s3.download_file(S3_BUCKET, s3_key, str(local_path))
+                log.info(f"Pulled {s3_key} from S3")
+            except s3.exceptions.ClientError:
+                pass  # doesn't exist yet — first run
+
     try:
-        # Import predict_upcoming and run it programmatically
         import importlib.util
         spec = importlib.util.spec_from_file_location(
             "predict_upcoming", str(TASK_ROOT / "tools/predict_upcoming.py")
@@ -96,19 +113,19 @@ def handler_predict(event, context):
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
 
-        # Ensure writable output directories exist under /tmp
-        (TMP / "out").mkdir(parents=True, exist_ok=True)
-        (TMP / "logs").mkdir(parents=True, exist_ok=True)
-
-        # Override module-level paths to point at /tmp
-        mod.DATA_DIR         = TMP / "data/processed"
-        mod.MODEL_DIR        = TMP / "data/processed/models"
-        mod.pred_log_path    = TMP / "out/predictions_log.csv"
-        mod.paper_trade_path = TMP / "logs/paper_trades.csv"
-
         import sys
         sys.argv = ["predict_upcoming.py", "--days", "2", "--allow-stale-ranks"]
         mod.main()
+
+        # Push outputs back to S3 so they survive container recycling
+        for s3_key, local_path in [
+            ("out/predictions_log.csv",  TMP / "out/predictions_log.csv"),
+            ("logs/paper_trades.csv",    TMP / "logs/paper_trades.csv"),
+        ]:
+            if local_path.exists():
+                s3.upload_file(str(local_path), S3_BUCKET, s3_key)
+                log.info(f"Pushed {s3_key} to S3")
+
         return {"statusCode": 200, "body": "Predictions complete"}
     except Exception as e:
         log.exception("Prediction run failed")

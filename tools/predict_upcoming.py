@@ -24,8 +24,8 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-DATA_DIR  = Path("data/processed")
-MODEL_DIR = DATA_DIR / "models"
+DATA_DIR  = Path(os.environ.get("TENNIS_DATA_DIR",  "data/processed"))
+MODEL_DIR = Path(os.environ.get("TENNIS_MODEL_DIR", str(DATA_DIR / "models")))
 
 # Betting decision engine thresholds — overridden at startup from
 # bet_thresholds.json if present (produced by `python main.py tune-thresholds`).
