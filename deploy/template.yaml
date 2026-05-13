@@ -1,0 +1,247 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Tennis Odds prediction system — Lambda + EventBridge + API Gateway
+
+# ── Parameters ────────────────────────────────────────────────────────────────
+Parameters:
+  S3BucketName:
+    Type: String
+    Default: tennis-odds-artifacts
+    Description: S3 bucket for model artifacts and data
+
+  OddsApiKey:
+    Type: String
+    NoEcho: true
+    Description: The Odds API key
+
+  SlackWebhook:
+    Type: String
+    NoEcho: true
+    Default: "none"
+    Description: Slack incoming webhook URL (optional)
+
+# ── Globals ───────────────────────────────────────────────────────────────────
+Globals:
+  Function:
+    Environment:
+      Variables:
+        S3_BUCKET: !Ref S3BucketName
+        ODDS_API_KEY: !Ref OddsApiKey
+        NOTIFY_SLACK_WEBHOOK: !Ref SlackWebhook
+        PYTHONPATH: /var/task/src
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── Shared IAM role for all Lambda functions ───────────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: tennis-odds-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${S3BucketName}"
+                  - !Sub "arn:aws:s3:::${S3BucketName}/*"
+
+  # ── Daily prediction function ────────────────────────────────────────────────
+  PredictFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tennis-predict-daily
+      Description: Daily ATP predictions + bet alerts
+      PackageType: Image
+      Architectures: [x86_64]
+      ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/tennis-odds:latest"
+      Timeout: 300
+      MemorySize: 1024
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          LAMBDA_FUNCTION: predict
+      Events:
+        DailySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 7 * * ? *)
+            Name: tennis-predict-daily
+            Description: Run daily ATP predictions
+    Metadata:
+      DockerTag: latest
+      DockerContext: ../
+      Dockerfile: deploy/Dockerfile
+
+  # ── CLV close function ───────────────────────────────────────────────────────
+  ClvCloseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tennis-clv-close
+      Description: Record closing Pinnacle prices for open bets
+      PackageType: Image
+      Architectures: [x86_64]
+      ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/tennis-odds:latest"
+      Timeout: 120
+      MemorySize: 512
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          LAMBDA_FUNCTION: clv-close
+      Events:
+        Morning:
+          Type: Schedule
+          Properties:
+            Schedule: cron(30 9 * * ? *)
+        Afternoon:
+          Type: Schedule
+          Properties:
+            Schedule: cron(30 12 * * ? *)
+        Evening:
+          Type: Schedule
+          Properties:
+            Schedule: cron(30 16 * * ? *)
+        Night:
+          Type: Schedule
+          Properties:
+            Schedule: cron(30 20 * * ? *)
+    Metadata:
+      DockerTag: latest
+      DockerContext: ../
+      Dockerfile: deploy/Dockerfile
+
+  # ── Check results function ───────────────────────────────────────────────────
+  CheckResultsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tennis-check-results
+      Description: Auto-fill actual match results
+      PackageType: Image
+      Architectures: [x86_64]
+      ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/tennis-odds:latest"
+      Timeout: 120
+      MemorySize: 512
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          LAMBDA_FUNCTION: check-results
+      Events:
+        NightlySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: cron(30 23 * * ? *)
+    Metadata:
+      DockerTag: latest
+      DockerContext: ../
+      Dockerfile: deploy/Dockerfile
+
+  # ── Injury refresh function ──────────────────────────────────────────────────
+  InjuryRefreshFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tennis-injury-refresh
+      Description: Refresh ATP injury/withdrawal data
+      PackageType: Image
+      Architectures: [x86_64]
+      ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/tennis-odds:latest"
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          LAMBDA_FUNCTION: injury-refresh
+      Events:
+        Every6Hours:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 */6 * * ? *)
+    Metadata:
+      DockerTag: latest
+      DockerContext: ../
+      Dockerfile: deploy/Dockerfile
+
+  # ── Weekly retrain function ──────────────────────────────────────────────────
+  RetrainFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tennis-retrain
+      Description: Full weekly model retrain pipeline
+      PackageType: Image
+      Architectures: [x86_64]
+      ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/tennis-odds:latest"
+      Timeout: 900
+      MemorySize: 3008
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          LAMBDA_FUNCTION: retrain
+      Events:
+        WeeklySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 3 ? * MON *)
+    Metadata:
+      DockerTag: latest
+      DockerContext: ../
+      Dockerfile: deploy/Dockerfile
+
+  # ── FastAPI function (HTTP API Gateway) ──────────────────────────────────────
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: tennis-api
+      Description: FastAPI prediction REST endpoint
+      PackageType: Image
+      Architectures: [x86_64]
+      ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/tennis-odds:latest"
+      Timeout: 30
+      MemorySize: 1024
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          LAMBDA_FUNCTION: api
+      Events:
+        HttpApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+    Metadata:
+      DockerTag: latest
+      DockerContext: ../
+      Dockerfile: deploy/Dockerfile
+
+  # ── HTTP API Gateway ─────────────────────────────────────────────────────────
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: prod
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowMethods: ["GET", "POST", "OPTIONS"]
+        AllowHeaders: ["Content-Type", "Authorization"]
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+Outputs:
+  ApiUrl:
+    Description: FastAPI endpoint URL
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+  S3Bucket:
+    Description: Artifacts S3 bucket
+    Value: !Ref S3BucketName

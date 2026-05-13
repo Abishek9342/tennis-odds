@@ -6,7 +6,7 @@ from pathlib import Path
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
+from sklearn.metrics import average_precision_score, brier_score_loss, log_loss, roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 
 DEFAULT_PARAMS = {
@@ -104,14 +104,15 @@ def _run_cv(X: pd.DataFrame, y: pd.Series, feature_cols: list[str],
 
         preds     = booster.predict(X_val)
         fold_loss = log_loss(y_val, preds)
-        fold_auc  = roc_auc_score(y_val, preds)
+        fold_auc    = roc_auc_score(y_val, preds)
+        fold_auc_pr = average_precision_score(y_val, preds)
         cv_losses.append(fold_loss)
         cv_aucs.append(fold_auc)
         best_iterations.append(booster.best_iteration)
-        print(f"  [{label}] Fold {fold+1}/{n_splits}: log-loss={fold_loss:.4f}  AUC={fold_auc:.4f}  best_iter={booster.best_iteration}")
+        print(f"  [{label}] Fold {fold+1}/{n_splits}: log-loss={fold_loss:.4f}  AUC-ROC={fold_auc:.4f}  AUC-PR={fold_auc_pr:.4f}  best_iter={booster.best_iteration}")
 
     print(f"\n  [{label}] CV mean log-loss : {np.mean(cv_losses):.4f} ± {np.std(cv_losses):.4f}")
-    print(f"  [{label}] CV mean AUC (OOS): {np.mean(cv_aucs):.4f} ± {np.std(cv_aucs):.4f}")
+    print(f"  [{label}] CV mean AUC-ROC  : {np.mean(cv_aucs):.4f} ± {np.std(cv_aucs):.4f}")
     return int(np.median(best_iterations)) or 200
 
 
@@ -334,13 +335,15 @@ def evaluate(
     y_test = test["label"].astype(int)
     probs  = eval_booster.predict(X_test)
 
-    ll    = log_loss(y_test, probs)
-    brier = brier_score_loss(y_test, probs)
-    auc   = roc_auc_score(y_test, probs)
+    ll     = log_loss(y_test, probs)
+    brier  = brier_score_loss(y_test, probs)
+    auc    = roc_auc_score(y_test, probs)
+    auc_pr = average_precision_score(y_test, probs)
 
     print(f"\nEvaluation on {TEST_START.date()}–{TEST_END.date()}:")
     print(f"  Rows        : {len(test):,}")
     print(f"  ROC-AUC     : {auc:.4f}")
+    print(f"  AUC-PR      : {auc_pr:.4f}")
     print(f"  Log-loss    : {ll:.4f}")
     print(f"  Brier score : {brier:.4f}")
 
@@ -357,7 +360,7 @@ def evaluate(
     else:
         roi = None
 
-    return {"log_loss": ll, "brier": brier, "auc": auc, "roi": roi}
+    return {"log_loss": ll, "brier": brier, "auc": auc, "auc_pr": auc_pr, "roi": roi}
 
 
 def _get_last_rank(raw_df: pd.DataFrame, player: str) -> float:
@@ -722,6 +725,494 @@ def tune_ensemble_weight(
 # ---------------------------------------------------------------------------
 # Threshold tuning
 # ---------------------------------------------------------------------------
+
+def train_surface_models(
+    features_parquet: Path,
+    out_dir: Path,
+    n_splits: int = 5,
+    params: dict | None = None,
+) -> dict:
+    """Train separate no-odds LightGBM models for each surface (Hard, Clay, Grass).
+
+    Each surface model is trained only on rows where surface == surface_name using
+    the same temporal split as train(): core up to TRAIN_END, val VAL_START–VAL_END.
+    Falls back to the global no-odds model if a surface has < 500 training rows.
+
+    Saves:
+        model_no_odds_hard.lgb   / feature_cols_no_odds_hard.json
+        model_no_odds_clay.lgb   / feature_cols_no_odds_clay.json
+        model_no_odds_grass.lgb  / feature_cols_no_odds_grass.json
+
+    Returns:
+        Dict mapping surface name to {"path": Path, "fallback": bool}.
+    """
+    SURFACES = ["Hard", "Clay", "Grass"]
+    MIN_TRAIN_ROWS = 500
+
+    df = pd.read_parquet(features_parquet)
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+
+    # Exclude test holdout
+    df = df[df["date"] < TEST_START].reset_index(drop=True)
+
+    lgb_params = {**DEFAULT_PARAMS, **(params or {})}
+    zero_gain  = _load_zero_gain_cols(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    results: dict = {}
+
+    for surface in SURFACES:
+        surf_key = surface.lower()
+        model_path = out_dir / f"model_no_odds_{surf_key}.lgb"
+        cols_path  = out_dir / f"feature_cols_no_odds_{surf_key}.json"
+
+        print(f"\n── Surface model: {surface} ──────────────────────────────────────")
+
+        surf_df  = df[df["surface"] == surface].reset_index(drop=True)
+        core_df  = surf_df[surf_df["date"] <= TRAIN_END].reset_index(drop=True)
+        val_df   = surf_df[
+            (surf_df["date"] >= VAL_START) & (surf_df["date"] <= VAL_END)
+        ].reset_index(drop=True)
+
+        print(f"  Core rows : {len(core_df):,}  |  Val rows: {len(val_df):,}")
+
+        if len(core_df) < MIN_TRAIN_ROWS:
+            print(f"  Fewer than {MIN_TRAIN_ROWS} core training rows — skipping (will fall back to global model).")
+            results[surface] = {"path": None, "fallback": True}
+            continue
+
+        feature_cols_no = [
+            c for c in df.columns
+            if c not in NON_FEATURE_COLS and c not in ODDS_COLS and c not in zero_gain
+        ]
+
+        X_core = core_df[feature_cols_no].astype(float)
+        y_core = core_df["label"].astype(int)
+
+        if not val_df.empty:
+            X_val = val_df[feature_cols_no].astype(float)
+            y_val = val_df["label"].astype(int)
+            booster = _train_final(
+                X_core, y_core, X_val, y_val,
+                feature_cols_no, lgb_params, n_splits, f"no_odds_{surf_key}",
+            )
+        else:
+            best_iter = _run_cv(X_core, y_core, feature_cols_no, lgb_params, n_splits, f"no_odds_{surf_key}")
+            dtrain    = lgb.Dataset(X_core, label=y_core, feature_name=feature_cols_no)
+            booster   = lgb.train(lgb_params, dtrain, num_boost_round=best_iter)
+
+        booster.save_model(str(model_path))
+        cols_path.write_text(json.dumps(feature_cols_no))
+        print(f"  Saved → {model_path}")
+        results[surface] = {"path": model_path, "fallback": False}
+
+    return results
+
+
+def predict_surface(
+    model_dir: Path,
+    p1: str,
+    p2: str,
+    surface: str,
+    raw_parquet: Path,
+    tournament: str | None = None,
+    round_label: str | None = None,
+) -> dict:
+    """Predict using the surface-specific no-odds model, falling back to the global one.
+
+    Returns the same probability dict as predict().
+    """
+    surf_key   = surface.lower()
+    model_path = model_dir / f"model_no_odds_{surf_key}.lgb"
+    cols_path  = model_dir / f"feature_cols_no_odds_{surf_key}.json"
+
+    if model_path.exists() and cols_path.exists():
+        print(f"[predict_surface] Using surface-specific model: {model_path.name}")
+    else:
+        print(f"[predict_surface] No surface model for '{surface}' — falling back to global no-odds model.")
+
+    # Delegate to predict(); it selects the model file via odds=None.
+    # For surface-specific, we temporarily patch the model_dir lookup by
+    # calling predict() then swapping the booster if the surface model exists.
+    result = predict(
+        model_dir=model_dir,
+        p1=p1,
+        p2=p2,
+        surface=surface,
+        raw_parquet=raw_parquet,
+        odds=None,
+        tournament=tournament,
+        round_label=round_label,
+    )
+
+    if model_path.exists() and cols_path.exists():
+        feature_cols = json.loads(cols_path.read_text())
+        booster      = lgb.Booster(model_file=str(model_path))
+        X            = pd.DataFrame([{col: result["features"].get(col, np.nan) for col in feature_cols}])
+        prob_p1      = float(booster.predict(X)[0])
+        result.update({
+            "p1_win_prob":  round(prob_p1, 4),
+            "p2_win_prob":  round(1 - prob_p1, 4),
+            "model_used":   f"no_odds_{surf_key}",
+            "booster":      booster,
+            "X":            X,
+            "feature_cols": feature_cols,
+        })
+        print(f"  [Surface model] {p1} win probability: {prob_p1:.1%}")
+        print(f"  [Surface model] {p2} win probability: {1 - prob_p1:.1%}")
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Walk-forward validation
+# ---------------------------------------------------------------------------
+
+def walk_forward_validate(
+    features_parquet: Path,
+    out_dir: Path,
+    n_windows: int = 6,
+    window_months: int = 6,
+) -> dict:
+    """Honest progressive out-of-sample validation using walk-forward windows.
+
+    Splits the validation window (VAL_START–VAL_END) into n_windows equal
+    time windows. For each window, trains on all data before the window start
+    (core+any earlier val sub-windows) and evaluates on the window itself.
+
+    Metrics per window: AUC, log-loss, Brier score, flat-stake ROI.
+    Summary: mean ± std across all windows.
+    Saves results to out_dir/walk_forward_results.json.
+
+    Returns dict with per-window metrics and summary stats.
+    """
+    df = pd.read_parquet(features_parquet)
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+
+    # Exclude test holdout
+    df = df[df["date"] < TEST_START].reset_index(drop=True)
+
+    zero_gain = _load_zero_gain_cols(out_dir)
+    feature_cols_no = [
+        c for c in df.columns
+        if c not in NON_FEATURE_COLS and c not in ODDS_COLS and c not in zero_gain
+    ]
+
+    # Build window boundaries within VAL_START..VAL_END
+    total_days   = (VAL_END - VAL_START).days + 1
+    window_days  = total_days // n_windows
+
+    windows: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    for i in range(n_windows):
+        w_start = VAL_START + pd.Timedelta(days=i * window_days)
+        if i < n_windows - 1:
+            w_end = VAL_START + pd.Timedelta(days=(i + 1) * window_days - 1)
+        else:
+            w_end = VAL_END
+        windows.append((w_start, w_end))
+
+    lgb_params = {**DEFAULT_PARAMS}
+
+    print(f"\n── Walk-forward validation ({n_windows} windows) ────────────────────────")
+    print(f"  Val period : {VAL_START.date()} → {VAL_END.date()}")
+    print(f"  Window size: ~{window_days} days each")
+
+    window_results = []
+
+    for i, (w_start, w_end) in enumerate(windows):
+        w_label = f"W{i+1} {w_start.date()}→{w_end.date()}"
+
+        # Train data: everything before this window
+        train_sub = df[df["date"] < w_start].reset_index(drop=True)
+        eval_sub  = df[(df["date"] >= w_start) & (df["date"] <= w_end)].reset_index(drop=True)
+
+        if train_sub.empty or eval_sub.empty:
+            print(f"\n  [{w_label}] Skipped (train={len(train_sub)}, eval={len(eval_sub)})")
+            continue
+
+        # Use the last ~18 months of training data as the val split for early stopping
+        es_cutoff = w_start - pd.DateOffset(months=6)
+        core_sub  = train_sub[train_sub["date"] < es_cutoff].reset_index(drop=True)
+        val_es    = train_sub[train_sub["date"] >= es_cutoff].reset_index(drop=True)
+
+        print(f"\n  [{w_label}]")
+        print(f"    Train  : {train_sub['date'].min().date()} → {train_sub['date'].max().date()}  ({len(train_sub):,} rows)")
+        print(f"    Eval   : {w_start.date()} → {w_end.date()}  ({len(eval_sub):,} rows)")
+
+        X_train = train_sub[feature_cols_no].astype(float)
+        y_train = train_sub["label"].astype(int)
+        X_eval  = eval_sub[feature_cols_no].astype(float)
+        y_eval  = eval_sub["label"].astype(int)
+
+        if not core_sub.empty and not val_es.empty:
+            X_core_sub = core_sub[feature_cols_no].astype(float)
+            y_core_sub = core_sub["label"].astype(int)
+            X_val_es   = val_es[feature_cols_no].astype(float)
+            y_val_es   = val_es["label"].astype(int)
+
+            dtrain_s1  = lgb.Dataset(X_core_sub, label=y_core_sub, feature_name=feature_cols_no)
+            dval_s1    = lgb.Dataset(X_val_es,   label=y_val_es,   reference=dtrain_s1)
+            cbs        = [lgb.early_stopping(50, verbose=False), lgb.log_evaluation(period=-1)]
+            bst_s1     = lgb.train(lgb_params, dtrain_s1, num_boost_round=1000,
+                                   valid_sets=[dval_s1], callbacks=cbs)
+            best_iter  = bst_s1.best_iteration or 200
+        else:
+            best_iter = 200
+
+        dtrain_final = lgb.Dataset(X_train, label=y_train, feature_name=feature_cols_no)
+        booster = lgb.train(lgb_params, dtrain_final, num_boost_round=best_iter)
+
+        probs  = booster.predict(X_eval)
+        auc    = roc_auc_score(y_eval, probs)
+        auc_pr = average_precision_score(y_eval, probs)
+        ll     = log_loss(y_eval, probs)
+        brier  = brier_score_loss(y_eval, probs)
+
+        # Flat-stake ROI: bet when model prob > 0.55 and odds available
+        roi = None
+        if "avgw" in eval_sub.columns:
+            bets = eval_sub.copy()
+            bets["prob"] = probs
+            bets = bets[(bets["prob"] > 0.55) & bets["avgw"].notna()]
+            if len(bets) >= 5:
+                profits = np.where(bets["label"] == 1, bets["avgw"] - 1, -1.0)
+                roi = round(float(profits.mean() * 100), 4)
+
+        print(f"    AUC-ROC={auc:.4f}  AUC-PR={auc_pr:.4f}  log-loss={ll:.4f}  Brier={brier:.4f}"
+              + (f"  flat-ROI={roi:+.2f}%" if roi is not None else ""))
+
+        window_results.append({
+            "window":    w_label,
+            "start":     str(w_start.date()),
+            "end":       str(w_end.date()),
+            "n_train":   int(len(train_sub)),
+            "n_eval":    int(len(eval_sub)),
+            "auc":       round(float(auc), 6),
+            "auc_pr":    round(float(auc_pr), 6),
+            "log_loss":  round(float(ll), 6),
+            "brier":     round(float(brier), 6),
+            "flat_roi":  roi,
+        })
+
+    # Summary statistics
+    if window_results:
+        aucs    = [w["auc"]      for w in window_results]
+        auc_prs = [w["auc_pr"]   for w in window_results]
+        lls     = [w["log_loss"] for w in window_results]
+        briers  = [w["brier"]    for w in window_results]
+        rois    = [w["flat_roi"] for w in window_results if w["flat_roi"] is not None]
+
+        summary = {
+            "n_windows":       len(window_results),
+            "auc_mean":        round(float(np.mean(aucs)),    6),
+            "auc_std":         round(float(np.std(aucs)),     6),
+            "auc_pr_mean":     round(float(np.mean(auc_prs)), 6),
+            "auc_pr_std":      round(float(np.std(auc_prs)),  6),
+            "log_loss_mean":   round(float(np.mean(lls)),     6),
+            "log_loss_std":    round(float(np.std(lls)),      6),
+            "brier_mean":      round(float(np.mean(briers)),  6),
+            "brier_std":       round(float(np.std(briers)),   6),
+            "flat_roi_mean":   round(float(np.mean(rois)),    4) if rois else None,
+            "flat_roi_std":    round(float(np.std(rois)),     4) if rois else None,
+        }
+
+        print(f"\n  Summary ({len(window_results)} windows):")
+        print(f"    AUC-ROC   : {summary['auc_mean']:.4f} ± {summary['auc_std']:.4f}")
+        print(f"    AUC-PR    : {summary['auc_pr_mean']:.4f} ± {summary['auc_pr_std']:.4f}")
+        print(f"    Log-loss  : {summary['log_loss_mean']:.4f} ± {summary['log_loss_std']:.4f}")
+        print(f"    Brier     : {summary['brier_mean']:.4f} ± {summary['brier_std']:.4f}")
+        if summary["flat_roi_mean"] is not None:
+            print(f"    Flat ROI  : {summary['flat_roi_mean']:+.2f}% ± {summary['flat_roi_std']:.2f}%")
+    else:
+        summary = {}
+
+    output = {"windows": window_results, "summary": summary}
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results_path = out_dir / "walk_forward_results.json"
+    results_path.write_text(json.dumps(output, indent=2))
+    print(f"\n  Saved → {results_path}")
+
+    return output
+
+
+# ---------------------------------------------------------------------------
+# Bet frequency analysis
+# ---------------------------------------------------------------------------
+
+def bet_frequency_stats(
+    features_parquet: Path,
+    model_dir: Path,
+    thresholds_path: Path | None = None,
+) -> dict:
+    """Analyse how often the model would trigger bets in the validation window.
+
+    Loads thresholds from bet_thresholds.json (defaults: edge>=4%, conf>=70%,
+    odds>=1.40). Runs predictions on the validation window and reports:
+      - Qualifying bets per week, per surface, per tournament category
+      - Avg / max bets per week, Kelly exposure per week
+      - Kelly bankroll simulation starting at $1000 with quarter-Kelly stakes
+
+    Returns dict with all stats.
+    """
+    # Load thresholds
+    thr_file = thresholds_path or (model_dir / "bet_thresholds.json")
+    if thr_file.exists():
+        thr = json.loads(thr_file.read_text())
+        min_edge = thr.get("min_edge", 0.04)
+        min_conf = thr.get("min_conf", 0.70)
+        min_odds = thr.get("min_odds", 1.40)
+        print(f"Thresholds loaded from {thr_file.name}: edge≥{min_edge:.0%}  conf≥{min_conf:.0%}  odds≥{min_odds:.2f}")
+    else:
+        min_edge, min_conf, min_odds = 0.04, 0.70, 1.40
+        print(f"No thresholds file — using defaults: edge≥{min_edge:.0%}  conf≥{min_conf:.0%}  odds≥{min_odds:.2f}")
+
+    df = pd.read_parquet(features_parquet)
+    df["date"] = pd.to_datetime(df["date"])
+    val = df[(df["date"] >= VAL_START) & (df["date"] <= VAL_END)].copy()
+
+    if val.empty:
+        print("No data in validation window.")
+        return {}
+
+    # Score with the global with-odds model (needed for edge vs pin probability)
+    cols_full = json.loads((model_dir / "feature_cols.json").read_text())
+    booster   = lgb.Booster(model_file=str(model_dir / "model.lgb"))
+
+    # Try to apply calibrator if available
+    cal_path = model_dir / "calibrator.json"
+    cal = None
+    if cal_path.exists():
+        try:
+            import sys as _sys
+            _sys.path.insert(0, str(model_dir.parent.parent / "src"))
+            from calibration import load_calibrator
+            cal = load_calibrator(cal_path)
+        except Exception:
+            pass
+
+    probs = booster.predict(val[cols_full].astype(float))
+    if cal is not None:
+        probs = cal.transform(probs)
+    val = val.copy()
+    val["prob_p1"] = probs
+
+    # Require odds to compute edge
+    has_odds = val["pin_prob_w"].notna() & (val["pin_prob_w"] > 0)
+    val = val[has_odds].copy()
+    val["vf_p1"]    = val["pin_prob_w"]
+    val["vf_odds"]  = 1.0 / val["pin_prob_w"]
+    val["real_odds"] = val["vf_odds"] * (1.0 - 0.024)
+    val["edge"]     = val["prob_p1"] - val["vf_p1"]
+
+    # Apply thresholds
+    bets = val[
+        (val["prob_p1"] >= min_conf) &
+        (val["edge"]    >= min_edge) &
+        (val["vf_odds"] >= min_odds)
+    ].copy()
+
+    print(f"\nQualifying bets in validation window: {len(bets):,} / {len(val):,} rows with odds")
+
+    if bets.empty:
+        return {"qualifying_bets": 0}
+
+    # Week column
+    bets["week"] = bets["date"].dt.to_period("W")
+
+    # Per-week counts
+    weekly = bets.groupby("week").size()
+    avg_bets_week = round(float(weekly.mean()), 2)
+    max_bets_week = int(weekly.max())
+
+    # Kelly stake per bet (quarter-Kelly)
+    b = bets["real_odds"] - 1.0
+    kelly_full = ((b * bets["prob_p1"] - (1 - bets["prob_p1"])) / b).clip(lower=0)
+    bets["kelly_q"] = kelly_full * 0.25
+
+    weekly_kelly = bets.groupby("week")["kelly_q"].sum()
+    avg_kelly_week = round(float(weekly_kelly.mean() * 100), 2)   # % of bankroll
+    max_kelly_week = round(float(weekly_kelly.max() * 100), 2)
+
+    # Per-surface breakdown
+    surface_counts: dict = {}
+    if "surface" in bets.columns:
+        surface_counts = bets.groupby("surface").size().to_dict()
+
+    # Tournament category (Grand Slam vs Masters vs 250)
+    tourn_counts: dict = {}
+    if "tournament" in bets.columns:
+        GRAND_SLAM_KEYWORDS = ["australian open", "roland garros", "wimbledon", "us open"]
+        MASTERS_KEYWORDS    = ["indian wells", "miami", "monte carlo", "madrid", "rome",
+                               "canada", "toronto", "montreal", "cincinnati", "shanghai",
+                               "paris", "bercy"]
+
+        def categorize(t: str) -> str:
+            tl = str(t).lower()
+            if any(gs in tl for gs in GRAND_SLAM_KEYWORDS):
+                return "Grand Slam"
+            if any(m in tl for m in MASTERS_KEYWORDS):
+                return "Masters 1000"
+            return "250/500"
+
+        bets["tourn_cat"] = bets["tournament"].apply(categorize)
+        tourn_counts = bets.groupby("tourn_cat").size().to_dict()
+
+    # Kelly bankroll simulation ($1000 start, quarter-Kelly week by week)
+    bankroll   = 1000.0
+    bankroll_history = [bankroll]
+    for week, week_bets in bets.sort_values("date").groupby("week"):
+        for _, row in week_bets.iterrows():
+            stake = bankroll * float(row["kelly_q"])
+            if row["label"] == 1:
+                bankroll += stake * float(row["real_odds"] - 1.0)
+            else:
+                bankroll -= stake
+        bankroll_history.append(round(bankroll, 2))
+
+    final_bankroll = round(bankroll, 2)
+    total_weeks    = len(weekly)
+
+    # Print formatted summary
+    print(f"\n{'='*60}")
+    print(f"  BET FREQUENCY ANALYSIS  |  Val: {VAL_START.date()} → {VAL_END.date()}")
+    print(f"{'='*60}")
+    print(f"  Thresholds    : edge≥{min_edge:.0%}  conf≥{min_conf:.0%}  odds≥{min_odds:.2f}")
+    print(f"  Total bets    : {len(bets):,}  over {total_weeks} active weeks")
+    print(f"  Avg bets/week : {avg_bets_week:.1f}")
+    print(f"  Max bets/week : {max_bets_week}")
+    print(f"  Avg Kelly exp : {avg_kelly_week:.2f}% of bankroll/week")
+    print(f"  Max Kelly exp : {max_kelly_week:.2f}% of bankroll/week")
+    print(f"\n  By surface:")
+    for surf, cnt in sorted(surface_counts.items()):
+        print(f"    {surf:<10}: {cnt:>4} bets  ({cnt/len(bets)*100:.1f}%)")
+    print(f"\n  By tournament category:")
+    for cat, cnt in sorted(tourn_counts.items()):
+        print(f"    {cat:<20}: {cnt:>4} bets  ({cnt/len(bets)*100:.1f}%)")
+    print(f"\n  Kelly bankroll sim ($1,000 start, quarter-Kelly):")
+    print(f"    Final bankroll : ${final_bankroll:,.2f}  ({(final_bankroll/1000 - 1)*100:+.1f}%)")
+    print(f"{'='*60}")
+
+    result = {
+        "thresholds":        {"min_edge": min_edge, "min_conf": min_conf, "min_odds": min_odds},
+        "qualifying_bets":   int(len(bets)),
+        "active_weeks":      int(total_weeks),
+        "avg_bets_per_week": avg_bets_week,
+        "max_bets_per_week": max_bets_week,
+        "avg_kelly_exposure_pct": avg_kelly_week,
+        "max_kelly_exposure_pct": max_kelly_week,
+        "by_surface":        {k: int(v) for k, v in surface_counts.items()},
+        "by_tournament_cat": {k: int(v) for k, v in tourn_counts.items()},
+        "kelly_sim": {
+            "start_bankroll":  1000.0,
+            "final_bankroll":  final_bankroll,
+            "return_pct":      round((final_bankroll / 1000 - 1) * 100, 2),
+            "bankroll_history": bankroll_history,
+        },
+    }
+    return result
+
 
 def tune_thresholds(
     model_dir: Path,

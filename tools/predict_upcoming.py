@@ -4,6 +4,9 @@ Usage:
     uv run python predict_upcoming.py
     uv run python predict_upcoming.py --days 3
     uv run python predict_upcoming.py --date 2026-04-30
+    uv run python predict_upcoming.py --paper-trade --bankroll 1000
+    uv run python predict_upcoming.py --explain
+    uv run python predict_upcoming.py --daily-cap 0.20
 """
 
 import argparse
@@ -19,7 +22,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 DATA_DIR  = Path("data/processed")
 MODEL_DIR = DATA_DIR / "models"
@@ -32,6 +35,9 @@ MIN_EDGE        = 0.03   # must have ≥ 3% edge over vig-free Pinnacle prob
 MIN_CONFIDENCE  = 0.70   # model probability must be ≥ 70%
 MIN_ODDS        = 1.40   # ← was 1.20; below 1.40 ROI is consistently negative
 KELLY_FRACTION  = 0.25   # quarter Kelly (conservative, recommended for live use)
+
+# Optional notify integration — imported lazily in main()
+_notify_mod = None
 
 
 def _load_thresholds() -> tuple[float, float, float]:
@@ -225,9 +231,21 @@ def _kelly_fractions(prob: float, decimal_odds: float) -> dict:
     return {"full": round(full, 4), "half": round(full / 2, 4), "quarter": round(full / 4, 4)}
 
 
-def _bet_rec(prob_p1: float, prob_p2: float, p1_odds: float | None, p2_odds: float | None,
-             p1_name: str, p2_name: str) -> dict:
-    """Apply decision engine. Returns a dict with kelly fractions and recommendation."""
+def _bet_rec(
+    prob_p1: float,
+    prob_p2: float,
+    p1_pin_odds: float | None,
+    p2_pin_odds: float | None,
+    p1_name: str,
+    p2_name: str,
+    p1_b365: float | None = None,
+    p2_b365: float | None = None,
+) -> dict:
+    """Apply decision engine. Returns a dict with kelly fractions and recommendation.
+
+    Edge is always calculated vs vig-free Pinnacle price (market efficiency baseline).
+    Kelly sizing and stake use the BEST available decimal odds across bookmakers.
+    """
     empty = {
         "kelly_p1": {"full": 0.0, "half": 0.0, "quarter": 0.0},
         "kelly_p2": {"full": 0.0, "half": 0.0, "quarter": 0.0},
@@ -235,57 +253,152 @@ def _bet_rec(prob_p1: float, prob_p2: float, p1_odds: float | None, p2_odds: flo
         "qualifies": False,
         "bet_on": None,
         "edge": 0.0,
+        "best_book_p1": None,
+        "best_book_p2": None,
+        "best_odds_p1": None,
+        "best_odds_p2": None,
     }
-    if not p1_odds or not p2_odds:
+    if not p1_pin_odds or not p2_pin_odds:
         return empty
 
-    vf_p1, vf_p2 = _vig_free_prob(p1_odds, p2_odds)
+    # Vig-free Pinnacle for edge calculation
+    vf_p1, vf_p2 = _vig_free_prob(p1_pin_odds, p2_pin_odds)
     e1 = prob_p1 - vf_p1
     e2 = prob_p2 - vf_p2
 
-    kf1 = _kelly_fractions(prob_p1, p1_odds)
-    kf2 = _kelly_fractions(prob_p2, p2_odds)
+    # Best available odds (line shopping)
+    if p1_b365 and p1_b365 > p1_pin_odds:
+        best_p1_odds, best_book_p1 = p1_b365, "Bet365"
+    else:
+        best_p1_odds, best_book_p1 = p1_pin_odds, "Pinnacle"
+
+    if p2_b365 and p2_b365 > p2_pin_odds:
+        best_p2_odds, best_book_p2 = p2_b365, "Bet365"
+    else:
+        best_p2_odds, best_book_p2 = p2_pin_odds, "Pinnacle"
+
+    # Kelly fractions use best available odds
+    kf1 = _kelly_fractions(prob_p1, best_p1_odds)
+    kf2 = _kelly_fractions(prob_p2, best_p2_odds)
 
     def _qualifies(prob: float, odds: float, edge_val: float) -> bool:
         return edge_val >= MIN_EDGE and prob >= MIN_CONFIDENCE and odds >= MIN_ODDS
 
-    q1 = _qualifies(prob_p1, p1_odds, e1)
-    q2 = _qualifies(prob_p2, p2_odds, e2)
+    # Qualify against best odds (more generous), edge still vs Pinnacle vig-free
+    q1 = _qualifies(prob_p1, best_p1_odds, e1)
+    q2 = _qualifies(prob_p2, best_p2_odds, e2)
 
     # Break-even win rate: the minimum win% needed to profit at these odds
-    be1 = 1.0 / p1_odds if p1_odds > 0 else 1.0
-    be2 = 1.0 / p2_odds if p2_odds > 0 else 1.0
+    be1 = 1.0 / best_p1_odds if best_p1_odds > 0 else 1.0
+    be2 = 1.0 / best_p2_odds if best_p2_odds > 0 else 1.0
 
     if q1 and kf1["quarter"] >= kf2["quarter"]:
         margin1 = prob_p1 - be1
-        rec = (f"BET {p1_name} — "
+        rec = (f"BET {p1_name} @ {best_p1_odds:.2f} ({best_book_p1}) — "
                f"QKelly {kf1['quarter']:.2%} | HKelly {kf1['half']:.2%} | "
                f"FKelly {kf1['full']:.2%}  "
                f"(edge vs Pinnacle {e1:+.1%} | margin over break-even {margin1:+.1%})")
         return {"kelly_p1": kf1, "kelly_p2": kf2, "rec": rec,
-                "qualifies": True, "bet_on": "p1", "edge": e1, "break_even": be1}
+                "qualifies": True, "bet_on": "p1", "edge": e1, "break_even": be1,
+                "best_book_p1": best_book_p1, "best_book_p2": best_book_p2,
+                "best_odds_p1": best_p1_odds, "best_odds_p2": best_p2_odds}
     elif q2 and kf2["quarter"] > kf1["quarter"]:
         margin2 = prob_p2 - be2
-        rec = (f"BET {p2_name} — "
+        rec = (f"BET {p2_name} @ {best_p2_odds:.2f} ({best_book_p2}) — "
                f"QKelly {kf2['quarter']:.2%} | HKelly {kf2['half']:.2%} | "
                f"FKelly {kf2['full']:.2%}  "
                f"(edge vs Pinnacle {e2:+.1%} | margin over break-even {margin2:+.1%})")
         return {"kelly_p1": kf1, "kelly_p2": kf2, "rec": rec,
-                "qualifies": True, "bet_on": "p2", "edge": e2, "break_even": be2}
+                "qualifies": True, "bet_on": "p2", "edge": e2, "break_even": be2,
+                "best_book_p1": best_book_p1, "best_book_p2": best_book_p2,
+                "best_odds_p1": best_p1_odds, "best_odds_p2": best_p2_odds}
     else:
         reasons = []
         best_prob = max(prob_p1, prob_p2)
         best_edge = max(e1, e2)
-        best_odds = p1_odds if prob_p1 >= prob_p2 else p2_odds
+        best_odds_val = best_p1_odds if prob_p1 >= prob_p2 else best_p2_odds
         if best_edge < MIN_EDGE:
             reasons.append(f"edge {best_edge:+.1%} < {MIN_EDGE:.0%}")
         if best_prob < MIN_CONFIDENCE:
             reasons.append(f"conf {best_prob:.1%} < {MIN_CONFIDENCE:.0%}")
-        if best_odds < MIN_ODDS:
-            reasons.append(f"odds {best_odds:.2f} < {MIN_ODDS:.2f} (short-price filter)")
+        if best_odds_val < MIN_ODDS:
+            reasons.append(f"odds {best_odds_val:.2f} < {MIN_ODDS:.2f} (short-price filter)")
         rec = "SKIP — " + ", ".join(reasons) if reasons else "SKIP — no qualifying edge"
         return {"kelly_p1": kf1, "kelly_p2": kf2, "rec": rec,
-                "qualifies": False, "bet_on": None, "edge": max(e1, e2), "break_even": None}
+                "qualifies": False, "bet_on": None, "edge": max(e1, e2), "break_even": None,
+                "best_book_p1": best_book_p1, "best_book_p2": best_book_p2,
+                "best_odds_p1": best_p1_odds, "best_odds_p2": best_p2_odds}
+
+
+# ── Paper trade helpers ───────────────────────────────────────────────────────
+
+PAPER_TRADE_COLS = [
+    "date", "p1", "p2", "surface", "tournament",
+    "bet_on", "odds", "kelly_quarter", "stake_dollar",
+    "model_prob", "edge", "actual_winner", "pnl",
+]
+
+
+def _load_paper_trades(path: Path) -> pd.DataFrame:
+    """Load existing paper trades CSV, or return empty DataFrame."""
+    if path.exists():
+        try:
+            return pd.read_csv(path)
+        except Exception:
+            pass
+    return pd.DataFrame(columns=PAPER_TRADE_COLS)
+
+
+def _append_paper_trade(
+    path: Path,
+    date: str,
+    p1: str,
+    p2: str,
+    surface: str,
+    tourn: str,
+    bet_on_name: str,
+    odds: float,
+    kelly_quarter: float,
+    stake_dollar: float,
+    model_prob: float,
+    edge: float,
+) -> None:
+    """Append a paper trade row; deduplicates on date+p1+p2."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = _load_paper_trades(path)
+    new_row = pd.DataFrame([{
+        "date":          date,
+        "p1":            p1,
+        "p2":            p2,
+        "surface":       surface,
+        "tournament":    tourn,
+        "bet_on":        bet_on_name,
+        "odds":          odds,
+        "kelly_quarter": kelly_quarter,
+        "stake_dollar":  stake_dollar,
+        "model_prob":    model_prob,
+        "edge":          edge,
+        "actual_winner": "",
+        "pnl":           "",
+    }])
+    combined = pd.concat([existing, new_row], ignore_index=True)
+    combined = combined.drop_duplicates(subset=["date", "p1", "p2"], keep="first")
+    combined.to_csv(path, index=False)
+
+
+def _today_spent(path: Path) -> float:
+    """Sum of today's stake_dollar entries in the given log CSV."""
+    today_str = str(datetime.date.today())
+    if not path.exists():
+        return 0.0
+    try:
+        df = pd.read_csv(path)
+        if "date" not in df.columns or "stake_dollar" not in df.columns:
+            return 0.0
+        today_rows = df[df["date"].astype(str) == today_str]
+        return float(today_rows["stake_dollar"].sum())
+    except Exception:
+        return 0.0
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -301,7 +414,23 @@ def main():
                         help="Proceed even if live ATP rank fetch fails (uses historical ranks).")
     parser.add_argument("--log-unknown", type=str, default="logs/unknown_players.csv",
                         help="CSV file to append unknown-player encounters to.")
+    # Feature 1: paper trade mode
+    parser.add_argument("--paper-trade", action="store_true",
+                        help="Log qualifying bets to logs/paper_trades.csv (simulation mode).")
+    # Feature 2: daily bankroll cap
+    parser.add_argument("--daily-cap", type=float, default=0.25,
+                        help="Max fraction of bankroll to stake in a single day (default 0.25 = 25%%).")
+    # Feature 4: SHAP explanations
+    parser.add_argument("--explain", action="store_true",
+                        help="Print top-10 SHAP feature contributions for qualifying bets.")
     args = parser.parse_args()
+
+    # ── Optional notify integration (Feature 5) ───────────────────────────────
+    global _notify_mod
+    try:
+        import notify as _notify_mod  # type: ignore
+    except ImportError:
+        _notify_mod = None
 
     # ── 1. Fetch upcoming matches ─────────────────────────────────────────────
     print(f"Fetching upcoming ATP matches (next {args.days} days)...")
@@ -314,7 +443,7 @@ def main():
         return
 
     singles = upcoming[~upcoming["tournament"].str.contains("Doubles", case=False, na=False)].copy()
-    singles = singles[singles["status"] == "Not started"].copy()
+    singles = singles[singles["status"].isin(["Not started", "scheduled"])].copy()
 
     if args.date:
         target = datetime.date.fromisoformat(args.date)
@@ -395,6 +524,23 @@ def main():
         except Exception as e:
             print(f"  Warning: could not load calibrator ({e}); using raw probabilities.")
 
+    # ── 4c. Daily cap setup (Feature 2) ──────────────────────────────────────
+    bankroll = args.bankroll
+    daily_cap_dollars = args.daily_cap * bankroll
+    _base             = Path(os.environ.get("TENNIS_OUTPUT_DIR", "."))
+    paper_trade_path  = _base / "logs/paper_trades.csv"
+    pred_log_path     = _base / "out/predictions_log.csv"
+
+    # Load today's already-staked amount from the relevant log
+    if args.paper_trade:
+        daily_spent = _today_spent(paper_trade_path)
+    else:
+        daily_spent = _today_spent(pred_log_path)
+
+    if daily_spent > 0:
+        print(f"Daily cap: already spent ${daily_spent:.2f} today "
+              f"(cap ${daily_cap_dollars:.2f} = {args.daily_cap:.0%} of ${bankroll:.0f}).")
+
     # Track players we couldn't resolve so user knows coverage gaps
     unknown_players: list[tuple[str, str]] = []
 
@@ -424,6 +570,7 @@ def main():
                 "P1 Rank (live)": "—",     "P2 Rank (live)": "—",
                 "Pinnacle P1 Odds": "—",   "Pinnacle P2 Odds": "—",
                 "Bet365 P1 Odds": "—",     "Bet365 P2 Odds": "—",
+                "Best Book P1": "—",        "Best Book P2": "—",
                 "Kelly P1 (fraction)": "—", "Kelly P2 (fraction)": "—",
                 f"$ Stake (bankroll ${args.bankroll:.0f})": "—",
                 "Favourite": "—",
@@ -448,7 +595,10 @@ def main():
 
         # ── No-odds prediction ────────────────────────────────────────────────
         X_no = pd.DataFrame([{col: feat.get(col, np.nan) for col in feat_cols_no_odds}])
-        prob_p1_no = float(booster_no_odds.predict(X_no)[0])
+        prob_p1_no_raw = float(booster_no_odds.predict(X_no)[0])
+        # Calibrated version used for display; raw version used in ensemble blend
+        # so the calibrator isn't applied twice when ENSEMBLE_W < 1.
+        prob_p1_no = float(calibrator.transform([prob_p1_no_raw])[0]) if calibrator is not None else prob_p1_no_raw
         prob_p2_no = 1.0 - prob_p1_no
 
         # ── Odds prediction + Kelly ───────────────────────────────────────────
@@ -458,7 +608,14 @@ def main():
         b365_p1_odds = b365_p2_odds = "—"
         bet_info = {"rec": "No odds available", "qualifies": False, "bet_on": None,
                     "kelly_p1": {"quarter": 0.0, "half": 0.0, "full": 0.0},
-                    "kelly_p2": {"quarter": 0.0, "half": 0.0, "full": 0.0}}
+                    "kelly_p2": {"quarter": 0.0, "half": 0.0, "full": 0.0},
+                    "best_book_p1": None, "best_book_p2": None,
+                    "best_odds_p1": None, "best_odds_p2": None}
+
+        # Store feature matrices for SHAP (Feature 4)
+        _X_for_shap = None
+        _booster_for_shap = None
+        _feat_cols_for_shap = None
 
         match_odds = _match_odds(live_odds_map, p1_raw, p2_raw) if live_odds_map else None
 
@@ -479,7 +636,7 @@ def main():
 
             # Ensemble blend. Weight is read from ensemble_weight.json (auto-tuned
             # by `python main.py tune-ensemble`), defaulting to DEFAULT_ENSEMBLE_W.
-            prob_p1_ensemble = ENSEMBLE_W * prob_p1_odds + (1 - ENSEMBLE_W) * prob_p1_no
+            prob_p1_ensemble = ENSEMBLE_W * prob_p1_odds + (1 - ENSEMBLE_W) * prob_p1_no_raw
             if calibrator is not None:
                 prob_p1_ensemble = float(calibrator.transform([prob_p1_ensemble])[0])
             prob_p2_ensemble = 1.0 - prob_p1_ensemble
@@ -488,8 +645,17 @@ def main():
             p2_dec_odds = match_odds["psl"]
 
             bet_info = _bet_rec(
-                prob_p1_ensemble, prob_p2_ensemble, p1_dec_odds, p2_dec_odds, p1, p2
+                prob_p1_ensemble, prob_p2_ensemble,
+                p1_dec_odds, p2_dec_odds,
+                p1, p2,
+                p1_b365=match_odds.get("b365w"),
+                p2_b365=match_odds.get("b365l"),
             )
+
+            # Store for SHAP (odds model path)
+            _X_for_shap         = X_odds
+            _booster_for_shap   = booster_odds
+            _feat_cols_for_shap = feat_cols_odds
 
             # CLV: stamp the opening Pinnacle price the moment we recommend a bet.
             # Later, `python -m clv_close` (run near match start) records the
@@ -501,6 +667,11 @@ def main():
                                     p1_dec_odds, p2_dec_odds, date=date)
                 except Exception as e:
                     print(f"  Warning: CLV open-record failed: {e}")
+        else:
+            # No-odds model path: use X_no for SHAP
+            _X_for_shap         = X_no
+            _booster_for_shap   = booster_no_odds
+            _feat_cols_for_shap = feat_cols_no_odds
 
         # Favourite: use ensemble when available, else no-odds
         _fav_prob_p1 = prob_p1_ensemble if prob_p1_ensemble is not None else prob_p1_no
@@ -508,7 +679,6 @@ def main():
         conf      = max(_fav_prob_p1, 1.0 - _fav_prob_p1)
 
         # Dollar stakes for all three Kelly sizes (show for bet_on side, else "—")
-        bankroll = args.bankroll
 
         def _stake(kf: dict, side: str) -> dict:
             """Return dict of $ stakes for quarter/half/full kelly on the given side."""
@@ -534,6 +704,43 @@ def main():
         kp1 = bet_info["kelly_p1"]
         kp2 = bet_info["kelly_p2"]
 
+        # ── Daily cap check (Feature 2) ───────────────────────────────────────
+        daily_cap_exceeded = False
+        if bet_info["qualifies"]:
+            bet_kf   = kp1 if bet_info["bet_on"] == "p1" else kp2
+            bet_stake = bet_kf["quarter"] * bankroll
+            if daily_spent + bet_stake > daily_cap_dollars:
+                daily_cap_exceeded = True
+
+        # ── Paper trade logging (Feature 1) ───────────────────────────────────
+        if bet_info["qualifies"] and args.paper_trade and not daily_cap_exceeded:
+            bet_side     = bet_info["bet_on"]   # "p1" or "p2"
+            bet_on_name  = p1 if bet_side == "p1" else p2
+            bet_kf       = kp1 if bet_side == "p1" else kp2
+            bet_odds_val = (bet_info.get("best_odds_p1") if bet_side == "p1"
+                            else bet_info.get("best_odds_p2"))
+            if bet_odds_val is None:
+                bet_odds_val = p1_dec_odds if bet_side == "p1" else p2_dec_odds
+            model_prob_val = prob_p1_ensemble if bet_side == "p1" else prob_p2_ensemble
+            if model_prob_val is None:
+                model_prob_val = prob_p1_no if bet_side == "p1" else prob_p2_no
+            stake_dollar = bet_kf["quarter"] * bankroll
+            _append_paper_trade(
+                path=paper_trade_path,
+                date=str(date),
+                p1=p1,
+                p2=p2,
+                surface=surface,
+                tourn=tourn,
+                bet_on_name=bet_on_name,
+                odds=bet_odds_val,
+                kelly_quarter=bet_kf["quarter"],
+                stake_dollar=stake_dollar,
+                model_prob=model_prob_val,
+                edge=bet_info["edge"],
+            )
+            daily_spent += stake_dollar
+
         results.append({
             "Date":                     str(date),
             "Tournament":               tourn,
@@ -553,6 +760,8 @@ def main():
             "Pinnacle P2 Odds":         p2_dec_odds,
             "Bet365 P1 Odds":           b365_p1_odds,
             "Bet365 P2 Odds":           b365_p2_odds,
+            "Best Book P1":             bet_info.get("best_book_p1") or "—",
+            "Best Book P2":             bet_info.get("best_book_p2") or "—",
             "Full Kelly P1 (frac)":     f"{kp1['full']:.4f}"    if kp1["full"]    > 0 else "—",
             "Half Kelly P1 (frac)":     f"{kp1['half']:.4f}"    if kp1["half"]    > 0 else "—",
             "Qrtr Kelly P1 (frac)":     f"{kp1['quarter']:.4f}" if kp1["quarter"] > 0 else "—",
@@ -564,11 +773,30 @@ def main():
             f"$ Full Kelly    (${bankroll:.0f})": sf,
             "Favourite":                f"{favourite} ({conf:.1%})",
             "Bet Recommendation":       bet_info["rec"],
+            "Daily Cap Exceeded":       daily_cap_exceeded,
             "Actual Winner":            "",
+            # Internal fields for post-loop annotation
+            "_qualifies":               bet_info["qualifies"],
+            "_daily_cap_exceeded":      daily_cap_exceeded,
+            "_X_for_shap":              _X_for_shap,
+            "_booster_for_shap":        _booster_for_shap,
+            "_feat_cols_for_shap":      _feat_cols_for_shap,
+            "_bet_info":                bet_info,
+            "_p1":                      p1,
+            "_p2":                      p2,
+            "_surface":                 surface,
+            "_tourn":                   tourn,
+            "_prob_p1_ensemble":        prob_p1_ensemble,
+            "_prob_p2_ensemble":        prob_p2_ensemble,
         })
 
     # ── 6. Print results ──────────────────────────────────────────────────────
-    df_out = pd.DataFrame(results)
+    # Strip internal fields before building the output DataFrame
+    _internal_keys = {k for k in results[0] if k.startswith("_")} if results else set()
+    internal_data  = [{k: r[k] for k in _internal_keys} for r in results]
+    clean_results  = [{k: v for k, v in r.items() if not k.startswith("_")} for r in results]
+
+    df_out = pd.DataFrame(clean_results)
     br = args.bankroll
     display_cols = [
         "Date", "Tournament", "Round", "Surface",
@@ -576,6 +804,7 @@ def main():
         "P1 Rank (live)", "P2 Rank (live)",
         "P1 Win % (ensemble)", "P2 Win % (ensemble)",
         "Pinnacle P1 Odds", "Pinnacle P2 Odds",
+        "Best Book P1", "Best Book P2",
         "Qrtr Kelly P1 (frac)", "Half Kelly P1 (frac)", "Full Kelly P1 (frac)",
         "Qrtr Kelly P2 (frac)", "Half Kelly P2 (frac)", "Full Kelly P2 (frac)",
         f"$ Quarter Kelly (${br:.0f})",
@@ -586,15 +815,65 @@ def main():
     display_cols = [c for c in display_cols if c in df_out.columns]
     print(df_out[display_cols].to_string(index=False))
 
+    # ── Post-loop: per-qualifying-bet actions ─────────────────────────────────
+    for i, (row_data, meta) in enumerate(zip(clean_results, internal_data)):
+        qualifies         = meta.get("_qualifies", False)
+        cap_exceeded      = meta.get("_daily_cap_exceeded", False)
+        bet_info_meta     = meta.get("_bet_info", {})
+        p1_m              = meta.get("_p1", "")
+        p2_m              = meta.get("_p2", "")
+        surface_m         = meta.get("_surface", "")
+        tourn_m           = meta.get("_tourn", "")
+        X_shap            = meta.get("_X_for_shap")
+        booster_shap      = meta.get("_booster_for_shap")
+        feat_cols_shap    = meta.get("_feat_cols_for_shap")
+
+        if not qualifies:
+            continue
+
+        prefix = "[PAPER TRADE] " if args.paper_trade else ""
+
+        if cap_exceeded:
+            print(f"\n[DAILY CAP REACHED] Skipping bet: {row_data['Bet Recommendation']}")
+            continue
+
+        # Print bet recommendation with paper trade prefix
+        print(f"\n{prefix}{row_data['Bet Recommendation']}")
+        if args.paper_trade:
+            print(f"  Logged to {paper_trade_path}")
+
+        # Feature 4: SHAP explanations
+        if args.explain and X_shap is not None and booster_shap is not None:
+            try:
+                shap_df = model_mod.explain_prediction(booster_shap, X_shap, feat_cols_shap)
+                top10 = shap_df.head(10)
+                print(f"\n  Top-10 SHAP features ({p1_m} vs {p2_m}):")
+                for _, shap_row in top10.iterrows():
+                    bar = "+" if shap_row["shap_value"] >= 0 else "-"
+                    print(f"    {bar} {shap_row['feature']:<40s}  "
+                          f"shap={shap_row['shap_value']:+.4f}  "
+                          f"val={shap_row['feature_value']:.4g}")
+            except Exception as e:
+                print(f"  Warning: SHAP explanation failed: {e}")
+
+        # Feature 5: notify integration
+        if _notify_mod is not None:
+            try:
+                _notify_mod.send_bet_alert(bet_info_meta, p1_m, p2_m, surface_m, tourn_m)
+            except Exception:
+                pass  # fail silently if notify is not configured
+
     # ── 7. Save output ────────────────────────────────────────────────────────
+    # Drop display-only helper column before saving
+    df_save = df_out.drop(columns=["Daily Cap Exceeded"], errors="ignore")
+
     if args.excel:
         date_tag = args.date or "upcoming"
-        out_path = Path(f"predictions_{date_tag}.xlsx")
+        out_path = Path(f"out/predictions_{date_tag}.xlsx")
         with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-            df_out.to_excel(writer, index=False, sheet_name="Predictions")
+            df_save.to_excel(writer, index=False, sheet_name="Predictions")
             # Bankroll summary sheet
-            bankroll = args.bankroll
-            bet_rows = df_out[df_out["Bet Recommendation"].str.startswith("BET", na=False)]
+            bet_rows = df_save[df_save["Bet Recommendation"].str.startswith("BET", na=False)]
 
             def _sum_col(col):
                 if col not in bet_rows.columns:
@@ -616,22 +895,25 @@ def main():
                 {"Item": "Total staked — Half Kelly",   "Value": f"${total_h:.2f}"},
                 {"Item": "Total staked — Full Kelly",   "Value": f"${total_f:.2f}"},
                 {"Item": "Remaining (Quarter Kelly)",   "Value": f"${bankroll - total_q:.2f}"},
-                {"Item": "Rules",                       "Value": "Edge ≥ 3%, Confidence ≥ 70%, Odds ≥ 1.20"},
+                {"Item": "Rules",                       "Value": f"Edge ≥ {MIN_EDGE:.0%}, Confidence ≥ {MIN_CONFIDENCE:.0%}, Odds ≥ {MIN_ODDS:.2f}"},
             ])
             summary.to_excel(writer, index=False, sheet_name="Bankroll Summary")
         print(f"\nPredictions saved → {out_path}")
     else:
-        out_path = Path("predictions_log.csv")
+        out_path = pred_log_path
         if out_path.exists():
             existing = pd.read_csv(out_path)
             # Preserve existing Actual Winner entries
-            merged = pd.concat([existing, df_out], ignore_index=True)
+            merged = pd.concat([existing, df_save], ignore_index=True)
             merged = merged.drop_duplicates(subset=["Date", "Player 1", "Player 2"], keep="first")
-            df_out = merged
-        df_out.to_csv(out_path, index=False)
+            df_save = merged
+        df_save.to_csv(out_path, index=False)
         print(f"\nPredictions saved → {out_path}")
 
     print("\nFill in the 'Actual Winner' column after matches finish to track accuracy.")
+
+    if args.paper_trade:
+        print(f"Paper trades logged to {paper_trade_path} — fill in 'actual_winner' after matches to track P&L.")
 
     # ── 8. Append unknown-player encounters to log ───────────────────────────
     if unknown_players:

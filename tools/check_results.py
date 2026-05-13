@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 
 def strip_accents(text: str) -> str:
@@ -53,7 +53,7 @@ def match_result_to_prediction(result_p1: str, result_p2: str,
 
 def main():
     parser = argparse.ArgumentParser(description="Auto-fill match results into predictions log")
-    parser.add_argument("--log", default="predictions_log.csv", help="Path to predictions CSV")
+    parser.add_argument("--log", default="out/predictions_log.csv", help="Path to predictions CSV")
     args = parser.parse_args()
 
     log_path = Path(args.log)

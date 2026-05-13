@@ -25,7 +25,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 DATA = ROOT / "data" / "processed"

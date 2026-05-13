@@ -105,6 +105,32 @@ def cmd_calibrate(args):
     )
 
 
+def cmd_train_surface(args):
+    import model
+    model.train_surface_models(
+        features_parquet=Path(args.features),
+        out_dir=MODEL_DIR,
+        n_splits=args.splits,
+    )
+
+
+def cmd_walk_forward(args):
+    import model
+    model.walk_forward_validate(
+        features_parquet=Path(args.features),
+        out_dir=MODEL_DIR,
+        n_windows=args.windows,
+    )
+
+
+def cmd_bet_freq(args):
+    import model
+    model.bet_frequency_stats(
+        features_parquet=Path(args.features),
+        model_dir=MODEL_DIR,
+    )
+
+
 def cmd_sanity(args):
     import sanity_check
     sys.exit(0 if sanity_check.run() else 1)
@@ -220,21 +246,47 @@ def main():
     p_cal.add_argument("--features", default=str(FEATURES_PARQUET))
     p_cal.add_argument("--method", choices=["platt", "isotonic"], default="isotonic")
 
+    # train-surface
+    p_surf = sub.add_parser(
+        "train-surface",
+        help="Train surface-specific no-odds models (Hard, Clay, Grass).",
+    )
+    p_surf.add_argument("--features", default=str(FEATURES_PARQUET))
+    p_surf.add_argument("--splits", type=int, default=5, help="CV folds")
+
+    # walk-forward
+    p_wf = sub.add_parser(
+        "walk-forward",
+        help="Walk-forward validation across the val window (honest progressive OOS).",
+    )
+    p_wf.add_argument("--features", default=str(FEATURES_PARQUET))
+    p_wf.add_argument("--windows", type=int, default=6, help="Number of time windows")
+
+    # bet-freq
+    p_bf = sub.add_parser(
+        "bet-freq",
+        help="Bet frequency analysis: bets/week, surface/tournament breakdown, Kelly sim.",
+    )
+    p_bf.add_argument("--features", default=str(FEATURES_PARQUET))
+
     # sanity check
     sub.add_parser("sanity", help="End-to-end smoke test (model load + single prediction).")
 
     args = parser.parse_args()
     {
-        "scrape":        cmd_scrape,
-        "features":      cmd_features,
-        "train":         cmd_train,
-        "evaluate":      cmd_evaluate,
-        "predict":       cmd_predict,
-        "ensemble":      cmd_ensemble,
+        "scrape":           cmd_scrape,
+        "features":         cmd_features,
+        "train":            cmd_train,
+        "evaluate":         cmd_evaluate,
+        "predict":          cmd_predict,
+        "ensemble":         cmd_ensemble,
         "tune-ensemble":    cmd_tune_ensemble,
         "tune-thresholds":  cmd_tune_thresholds,
         "calibrate":        cmd_calibrate,
-        "sanity":        cmd_sanity,
+        "sanity":           cmd_sanity,
+        "train-surface":    cmd_train_surface,
+        "walk-forward":     cmd_walk_forward,
+        "bet-freq":         cmd_bet_freq,
     }[args.command](args)
 
 

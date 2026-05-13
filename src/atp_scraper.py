@@ -241,24 +241,114 @@ def fetch_atp_scores() -> pd.DataFrame:
     return pd.DataFrame(matches)
 
 
-def fetch_atp_upcoming(days_ahead: int = 2) -> pd.DataFrame:
+def fetch_atp_upcoming(days_ahead: int = 2, odds_api_key: str | None = None) -> pd.DataFrame:
     """
-    Fetch upcoming ATP singles matches for the next *days_ahead* days
-    using the Sofascore unofficial JSON API.
+    Fetch upcoming ATP singles matches.
+
+    Primary source: The Odds API (works from AWS Lambda / any server IP).
+    Fallback:       Sofascore (works locally, blocked by AWS IPs).
 
     Returns
     -------
     DataFrame with columns:
         date (date) | tournament (str) | surface (str) | round (str)
         | player1 (str) | player2 (str) | status (str)
-
-    Rows are ordered by date then tournament.
-
-    Raises
-    ------
-    RuntimeError  if no ATP events are found.
-    requests.HTTPError / requests.ConnectionError  on network failure.
     """
+    import os
+    key = odds_api_key or os.environ.get("ODDS_API_KEY", "")
+    if key:
+        try:
+            return _fetch_upcoming_odds_api(key, days_ahead)
+        except Exception as exc:
+            print(f"  [Odds API fixture fetch failed: {exc}] — falling back to Sofascore")
+
+    return _fetch_upcoming_sofascore(days_ahead)
+
+
+def _fetch_upcoming_odds_api(api_key: str, days_ahead: int) -> pd.DataFrame:
+    """Fetch upcoming ATP fixtures from The Odds API.
+
+    First discovers all active ATP tournament sport-keys, then queries each
+    for h2h odds. The free tier lists individual tournaments rather than a
+    single generic ATP feed.
+    """
+    base = "https://api.the-odds-api.com/v4"
+
+    # Step 1 — discover active ATP sport keys
+    sports_resp = requests.get(f"{base}/sports/", params={"apiKey": api_key}, timeout=15)
+    sports_resp.raise_for_status()
+    atp_keys = [
+        s["key"] for s in sports_resp.json()
+        if s.get("key", "").startswith("tennis_atp") and s.get("active", False)
+    ]
+    if not atp_keys:
+        raise RuntimeError("No active ATP sport keys found on The Odds API.")
+
+    cutoff = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=days_ahead + 1)
+    rows: list[dict] = []
+
+    # Step 2 — query each tournament
+    for sport_key in atp_keys:
+        try:
+            resp = requests.get(
+                f"{base}/sports/{sport_key}/odds/",
+                params={
+                    "apiKey":     api_key,
+                    "regions":    "eu",
+                    "markets":    "h2h",
+                    "oddsFormat": "decimal",
+                    "dateFormat": "iso",
+                },
+                timeout=15,
+            )
+            if resp.status_code == 404:
+                continue
+            resp.raise_for_status()
+        except requests.HTTPError:
+            continue
+
+        for ev in resp.json():
+            commence = ev.get("commence_time", "")
+            try:
+                dt = datetime.datetime.fromisoformat(commence.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if dt > cutoff:
+                continue
+
+            player1 = ev.get("home_team", "")
+            player2 = ev.get("away_team", "")
+            if not player1 or not player2:
+                continue
+
+            # Derive a clean tournament name from the sport key
+            # e.g. "tennis_atp_italian_open" → "Italian Open"
+            tournament = " ".join(
+                w.title() for w in sport_key.replace("tennis_atp_", "").split("_")
+            ) or "ATP"
+
+            rows.append({
+                "date":       dt.date(),
+                "tournament": tournament,
+                "surface":    "",   # Odds API doesn't provide surface
+                "round":      "",
+                "player1":    player1,
+                "player2":    player2,
+                "status":     "scheduled",
+                "event_id":   ev.get("id", ""),
+            })
+
+    if not rows:
+        raise RuntimeError("No upcoming ATP matches found via Odds API.")
+
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    return df.drop_duplicates(subset=["player1", "player2", "date"]) \
+             .sort_values(["date", "tournament"]).reset_index(drop=True)
+
+
+def _fetch_upcoming_sofascore(days_ahead: int) -> pd.DataFrame:
+    """Fetch upcoming ATP fixtures from Sofascore (local use; blocked on Lambda)."""
     today = datetime.date.today()
     dates = [today + datetime.timedelta(d) for d in range(days_ahead + 1)]
 
@@ -280,13 +370,13 @@ def fetch_atp_upcoming(days_ahead: int = 2) -> pd.DataFrame:
             if status == "Ended":
                 continue
             rows.append({
-                "date": day,
+                "date":       day,
                 "tournament": e.get("tournament", {}).get("name", ""),
-                "surface": _sofascore_surface(e),
-                "round": e.get("roundInfo", {}).get("name", ""),
-                "player1": e.get("homeTeam", {}).get("name", ""),
-                "player2": e.get("awayTeam", {}).get("name", ""),
-                "status": status,
+                "surface":    _sofascore_surface(e),
+                "round":      e.get("roundInfo", {}).get("name", ""),
+                "player1":    e.get("homeTeam", {}).get("name", ""),
+                "player2":    e.get("awayTeam", {}).get("name", ""),
+                "status":     status,
             })
 
     if not rows:
