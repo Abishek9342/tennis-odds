@@ -107,19 +107,19 @@ def strip_accents(text: str) -> str:
 # ── Live Rankings ────────────────────────────────────────────────────────────
 
 def fetch_live_ranks(known: list[str], top_n: int = 200) -> tuple[dict[str, int], bool]:
-    """Return ({internal_name: live_rank}, live_ok). live_ok is False if the
-    fetch failed and the caller will be using stale historical ranks."""
+    """Return ({internal_name: live_rank}, live_ok). Falls back to rankings_cache.json."""
     from atp_scraper import get_live_rank_map
+    cache = str(MODEL_DIR / "rankings_cache.json")
     try:
         print("Fetching live ATP rankings...")
-        rank_map = get_live_rank_map(known, top_n=top_n)
+        rank_map = get_live_rank_map(known, top_n=top_n, cache_path=cache)
         print(f"  Got {len(rank_map)} live ranks.")
         if not rank_map:
-            print("  ⚠️  WARNING: live ranking API returned 0 players — predictions will use stale historical ranks.")
+            print("  ⚠️  WARNING: rankings unavailable — predictions will use stale historical ranks.")
             return {}, False
         return rank_map, True
     except Exception as e:
-        print(f"  ⚠️  WARNING: live rankings fetch FAILED ({e}). Predictions will use stale historical ranks.")
+        print(f"  ⚠️  WARNING: live rankings fetch FAILED ({e}). Using stale historical ranks.")
         return {}, False
 
 
@@ -152,11 +152,10 @@ def fetch_live_odds(api_key: str) -> dict[tuple[str, str], dict]:
             r = requests.get(
                 f"{base}/sports/{sport_key}/odds",
                 params={
-                    "apiKey":      api_key,
-                    "regions":     "eu",
-                    "markets":     "h2h",
-                    "oddsFormat":  "decimal",
-                    "bookmakers":  "pinnacle,bet365",
+                    "apiKey":     api_key,
+                    "regions":    "eu,uk,us",
+                    "markets":    "h2h",
+                    "oddsFormat": "decimal",
                 },
                 timeout=10,
             )
@@ -165,6 +164,10 @@ def fetch_live_odds(api_key: str) -> dict[tuple[str, str], dict]:
                 home = match["home_team"].lower()
                 away = match["away_team"].lower()
                 entry = all_odds.get((home, away), {})
+                best_home = entry.get("best_home", 0.0)
+                best_away = entry.get("best_away", 0.0)
+                best_home_book = entry.get("best_home_book", "")
+                best_away_book = entry.get("best_away_book", "")
                 for bk in match.get("bookmakers", []):
                     for mkt in bk.get("markets", []):
                         if mkt["key"] != "h2h":
@@ -176,6 +179,17 @@ def fetch_live_odds(api_key: str) -> dict[tuple[str, str], dict]:
                         elif bk["key"] == "bet365":
                             entry["b365w"] = outcome_map.get(home)
                             entry["b365l"] = outcome_map.get(away)
+                        # Track best odds across all books for line shopping
+                        ph = outcome_map.get(home) or 0.0
+                        pa = outcome_map.get(away) or 0.0
+                        if ph > best_home:
+                            best_home, best_home_book = ph, bk["key"]
+                        if pa > best_away:
+                            best_away, best_away_book = pa, bk["key"]
+                entry["best_home"] = best_home
+                entry["best_away"] = best_away
+                entry["best_home_book"] = best_home_book
+                entry["best_away_book"] = best_away_book
                 all_odds[(home, away)] = entry
         except Exception as e:
             print(f"  Warning: odds fetch failed for {sport_key} ({e}).")
@@ -196,12 +210,15 @@ def _match_odds(odds_map: dict, p1_raw: str, p2_raw: str) -> dict | None:
             return {
                 "psw": odds.get("psw"), "psl": odds.get("psl"),
                 "b365w": odds.get("b365w"), "b365l": odds.get("b365l"),
+                "best_p1": odds.get("best_home"), "best_p2": odds.get("best_away"),
+                "best_p1_book": odds.get("best_home_book"), "best_p2_book": odds.get("best_away_book"),
             }
         if p2_last in home_last and p1_last in away_last:
-            # Swap so p1=home perspective flipped
             return {
                 "psw": odds.get("psl"),   "psl": odds.get("psw"),
                 "b365w": odds.get("b365l"), "b365l": odds.get("b365w"),
+                "best_p1": odds.get("best_away"), "best_p2": odds.get("best_home"),
+                "best_p1_book": odds.get("best_away_book"), "best_p2_book": odds.get("best_home_book"),
             }
     return None
 
@@ -240,11 +257,15 @@ def _bet_rec(
     p2_name: str,
     p1_b365: float | None = None,
     p2_b365: float | None = None,
+    p1_best: float | None = None,
+    p2_best: float | None = None,
+    p1_best_book: str | None = None,
+    p2_best_book: str | None = None,
 ) -> dict:
     """Apply decision engine. Returns a dict with kelly fractions and recommendation.
 
     Edge is always calculated vs vig-free Pinnacle price (market efficiency baseline).
-    Kelly sizing and stake use the BEST available decimal odds across bookmakers.
+    Kelly sizing and stake use the BEST available decimal odds across ALL bookmakers.
     """
     empty = {
         "kelly_p1": {"full": 0.0, "half": 0.0, "quarter": 0.0},
@@ -266,16 +287,16 @@ def _bet_rec(
     e1 = prob_p1 - vf_p1
     e2 = prob_p2 - vf_p2
 
-    # Best available odds (line shopping)
-    if p1_b365 and p1_b365 > p1_pin_odds:
-        best_p1_odds, best_book_p1 = p1_b365, "Bet365"
-    else:
-        best_p1_odds, best_book_p1 = p1_pin_odds, "Pinnacle"
+    # Best available odds across ALL bookmakers (line shopping)
+    best_p1_odds, best_book_p1 = p1_pin_odds, "Pinnacle"
+    for odds_val, book in [(p1_b365, "Bet365"), (p1_best, p1_best_book or "Other")]:
+        if odds_val and odds_val > best_p1_odds:
+            best_p1_odds, best_book_p1 = odds_val, book
 
-    if p2_b365 and p2_b365 > p2_pin_odds:
-        best_p2_odds, best_book_p2 = p2_b365, "Bet365"
-    else:
-        best_p2_odds, best_book_p2 = p2_pin_odds, "Pinnacle"
+    best_p2_odds, best_book_p2 = p2_pin_odds, "Pinnacle"
+    for odds_val, book in [(p2_b365, "Bet365"), (p2_best, p2_best_book or "Other")]:
+        if odds_val and odds_val > best_p2_odds:
+            best_p2_odds, best_book_p2 = odds_val, book
 
     # Kelly fractions use best available odds
     kf1 = _kelly_fractions(prob_p1, best_p1_odds)
@@ -486,6 +507,19 @@ def main():
         booster_odds = None
         feat_cols_odds = []
 
+    # Surface-specific models (blended in at 15% weight when available)
+    _surface_boosters: dict[str, tuple] = {}
+    for surf in ("hard", "clay", "grass"):
+        sp = MODEL_DIR / f"model_no_odds_{surf}.lgb"
+        cp = MODEL_DIR / f"feature_cols_no_odds_{surf}.json"
+        if sp.exists() and cp.exists():
+            _surface_boosters[surf.capitalize()] = (
+                lgb.Booster(model_file=str(sp)),
+                json.loads(cp.read_text()),
+            )
+    if _surface_boosters:
+        print(f"  Surface models loaded: {list(_surface_boosters.keys())}")
+
     print("Model loaded.\n")
 
     # ── 3. Live rankings ──────────────────────────────────────────────────────
@@ -582,11 +616,12 @@ def main():
         feat = feat_mod.get_live_features(tracker, p1, p2, surface)
 
         # Tournament context features — must be set at inference to match training
-        feat["surface_code"]  = float(feat_mod.SURFACE_MAP.get(surface, float("nan")))
-        feat["is_grand_slam"] = 1.0 if any(gs.lower() in str(tourn).lower() for gs in feat_mod.GRAND_SLAMS) else 0.0
-        feat["round_num"]     = float(feat_mod.ROUND_MAP.get(str(rnd).strip(), float("nan")))
-        # Grand Slam men's singles are best of 5; all other ATP events are best of 3
-        feat["is_best_of_5"]  = feat["is_grand_slam"]
+        feat["surface_code"]    = float(feat_mod.SURFACE_MAP.get(surface, float("nan")))
+        feat["is_grand_slam"]   = 1.0 if any(gs.lower() in str(tourn).lower() for gs in feat_mod.GRAND_SLAMS) else 0.0
+        feat["round_num"]       = float(feat_mod.ROUND_MAP.get(str(rnd).strip(), float("nan")))
+        feat["is_best_of_5"]    = feat["is_grand_slam"]
+        feat["is_high_altitude"]= 1.0 if any(h in str(tourn).lower() for h in feat_mod._HIGH_ALTITUDE) else 0.0
+        feat["is_indoor"]       = 1.0 if any(i in str(tourn).lower() for i in feat_mod._INDOOR) else 0.0
 
         # Use live rank if available, else fall back to historical
         p1_rank = live_ranks.get(p1) or model_mod._get_last_rank(raw_df, p1)
@@ -596,6 +631,14 @@ def main():
         # ── No-odds prediction ────────────────────────────────────────────────
         X_no = pd.DataFrame([{col: feat.get(col, np.nan) for col in feat_cols_no_odds}])
         prob_p1_no_raw = float(booster_no_odds.predict(X_no)[0])
+
+        # Surface-specific model blend (10% weight when available)
+        if surface in _surface_boosters:
+            _surf_booster, _surf_cols = _surface_boosters[surface]
+            X_surf = pd.DataFrame([{col: feat.get(col, np.nan) for col in _surf_cols}])
+            prob_surf = float(_surf_booster.predict(X_surf)[0])
+            prob_p1_no_raw = 0.9 * prob_p1_no_raw + 0.1 * prob_surf
+
         # Calibrated version used for display; raw version used in ensemble blend
         # so the calibrator isn't applied twice when ENSEMBLE_W < 1.
         prob_p1_no = float(calibrator.transform([prob_p1_no_raw])[0]) if calibrator is not None else prob_p1_no_raw
@@ -650,6 +693,10 @@ def main():
                 p1, p2,
                 p1_b365=match_odds.get("b365w"),
                 p2_b365=match_odds.get("b365l"),
+                p1_best=match_odds.get("best_p1"),
+                p2_best=match_odds.get("best_p2"),
+                p1_best_book=match_odds.get("best_p1_book"),
+                p2_best_book=match_odds.get("best_p2_book"),
             )
 
             # Store for SHAP (odds model path)

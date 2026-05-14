@@ -54,6 +54,8 @@ class _PlayerTracker:
         self._history: dict[str, list] = defaultdict(list)
         # h2h[(p1,p2)] canonical sorted = list of (date, winner, surface)
         self._h2h: dict[tuple, list] = defaultdict(list)
+        # last match date per player for time-weighted K
+        self._last_date: dict[str, pd.Timestamp] = {}
 
     # ------------------------------------------------------------------
     # Elo queries
@@ -240,15 +242,27 @@ class _PlayerTracker:
         w_elo_surf_pre = self._surface_elo[(winner, surface)]
         l_elo_surf_pre = self._surface_elo[(loser, surface)]
 
+        # Time-weighted K: recent matches (< 180 days) get up to 1.5x base K
+        # so in-form players' Elo responds faster to current results
+        def _tw_k(player: str) -> float:
+            last = self._last_date.get(player)
+            if last is None:
+                return float(self._k)
+            gap = max((date - last).days, 0)
+            return self._k * (1.0 + 0.5 * np.exp(-gap / 180.0))
+
+        k_w = _tw_k(winner)
+        k_l = _tw_k(loser)
+
         # Update global Elo
         exp_w = 1 / (1 + 10 ** ((l_elo_pre - w_elo_pre) / 400))
-        self._global_elo[winner] = w_elo_pre + self._k * (1 - exp_w)
-        self._global_elo[loser]  = l_elo_pre + self._k * (0 - (1 - exp_w))
+        self._global_elo[winner] = w_elo_pre + k_w * (1 - exp_w)
+        self._global_elo[loser]  = l_elo_pre + k_l * (0 - (1 - exp_w))
 
         # Update surface Elo
         exp_w_s = 1 / (1 + 10 ** ((l_elo_surf_pre - w_elo_surf_pre) / 400))
-        self._surface_elo[(winner, surface)] = w_elo_surf_pre + self._k * (1 - exp_w_s)
-        self._surface_elo[(loser,  surface)] = l_elo_surf_pre + self._k * (0 - (1 - exp_w_s))
+        self._surface_elo[(winner, surface)] = w_elo_surf_pre + k_w * (1 - exp_w_s)
+        self._surface_elo[(loser,  surface)] = l_elo_surf_pre + k_l * (0 - (1 - exp_w_s))
 
         # Safe set values
         ws = float(w_sets) if pd.notna(w_sets) else None
@@ -257,6 +271,8 @@ class _PlayerTracker:
 
         self._history[winner].append((date, surface, True,  ws, ls, l_elo_pre, bo))
         self._history[loser].append( (date, surface, False, ls, ws, w_elo_pre, bo))
+        self._last_date[winner] = date
+        self._last_date[loser]  = date
 
         key = tuple(sorted([winner, loser]))
         self._h2h[key].append((date, winner, surface))
@@ -390,9 +406,15 @@ def build_odds_features(df: pd.DataFrame) -> pd.DataFrame:
             max_w = raw_w / (raw_w + raw_l)
             rec["max_prob_w"] = max_w
             rec["max_prob_l"] = 1.0 - max_w
+            # Odds movement: max book vs Pinnacle — positive = sharp money on winner
+            if pd.notna(rec.get("pin_prob_w")):
+                rec["odds_movement_w"] = max_w - rec["pin_prob_w"]
+            else:
+                rec["odds_movement_w"] = np.nan
         else:
             rec["max_prob_w"] = np.nan
             rec["max_prob_l"] = np.nan
+            rec["odds_movement_w"] = np.nan
 
         rows.append(rec)
     return pd.DataFrame(rows, index=df.index)
@@ -435,6 +457,18 @@ def build_rank_features(df: pd.DataFrame) -> pd.DataFrame:
 # Tournament context features (fully vectorised)
 # ---------------------------------------------------------------------------
 
+_HIGH_ALTITUDE = {
+    "madrid", "bogota", "kitzbuhel", "gstaad", "mexico city", "acapulco",
+    "quito", "lima", "santiago", "guadalajara",
+}
+
+_INDOOR = {
+    "rotterdam", "basel", "vienna", "bercy", "paris", "sofia", "montpellier",
+    "marseille", "lyon", "metz", "antwerp", "milan", "stockholm", "moscow",
+    "st. petersburg", "zhuhai", "nitto", "atp finals",
+}
+
+
 def build_tournament_context_features(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(index=df.index)
 
@@ -450,6 +484,12 @@ def build_tournament_context_features(df: pd.DataFrame) -> pd.DataFrame:
     out["surface_code"] = df["surface"].apply(
         lambda s: float(SURFACE_MAP.get(str(s).strip(), np.nan))
     )
+    out["is_high_altitude"] = df["tournament"].apply(
+        lambda t: 1.0 if any(h in str(t).lower() for h in _HIGH_ALTITUDE) else 0.0
+    )
+    out["is_indoor"] = df["tournament"].apply(
+        lambda t: 1.0 if any(i in str(t).lower() for i in _INDOOR) else 0.0
+    )
     return out
 
 
@@ -457,8 +497,38 @@ def build_tournament_context_features(df: pd.DataFrame) -> pd.DataFrame:
 # Main orchestrator
 # ---------------------------------------------------------------------------
 
+def build_injury_features(df: pd.DataFrame, injury_log_path: Path | None = None) -> pd.DataFrame:
+    """Merge injury risk signals per player per match date. Returns NaN if log missing."""
+    default = Path("data/processed/injury_log.parquet")
+    log_path = injury_log_path or default
+    if not log_path.exists():
+        n = len(df)
+        return pd.DataFrame({
+            "w_injury_risk_14d": np.zeros(n), "l_injury_risk_14d": np.zeros(n),
+            "w_retired_30d": np.zeros(n),     "l_retired_30d": np.zeros(n),
+            "w_walkover_60d": np.zeros(n),    "l_walkover_60d": np.zeros(n),
+        }, index=df.index)
+
+    log = pd.read_parquet(log_path)
+    log["date"] = pd.to_datetime(log["date"])
+    rows = []
+    for _, row in df.iterrows():
+        date = pd.Timestamp(row["date"])
+        rec: dict = {}
+        for prefix, player in [("w_", row["winner"]), ("l_", row["loser"])]:
+            sub = log[log["player"] == player]
+            c14 = date - pd.Timedelta(days=14)
+            c30 = date - pd.Timedelta(days=30)
+            c60 = date - pd.Timedelta(days=60)
+            rec[f"{prefix}injury_risk_14d"] = float(min(1.0, len(sub[(sub["event"]=="withdrawal") & (sub["date"]>=c14)])))
+            rec[f"{prefix}retired_30d"]     = float(len(sub[(sub["event"]=="retirement") & (sub["date"]>=c30)]))
+            rec[f"{prefix}walkover_60d"]    = float(len(sub[(sub["event"]=="walkover")   & (sub["date"]>=c60)]))
+        rows.append(rec)
+    return pd.DataFrame(rows, index=df.index)
+
+
 def build_features(raw_parquet: Path, out: Path,
-                   windows: list[int] = [10, 30, 90]) -> pd.DataFrame:
+                   windows: list[int] = [10, 14, 30, 90]) -> pd.DataFrame:
     """Build the full feature matrix from raw match data and save to Parquet."""
     df = pd.read_parquet(raw_parquet)
     df = df.sort_values("date").reset_index(drop=True)
@@ -475,9 +545,12 @@ def build_features(raw_parquet: Path, out: Path,
     print("Building tournament context features...")
     context = build_tournament_context_features(df)
 
+    print("Building injury features...")
+    injury = build_injury_features(df, raw_parquet.parent / "injury_log.parquet")
+
     # Combine
     base = df[["date", "winner", "loser", "surface", "round", "best_of", "tournament"]].copy()
-    combined = pd.concat([base, player_feats, odds, ranks, context], axis=1)
+    combined = pd.concat([base, player_feats, odds, ranks, context, injury], axis=1)
 
     # Fill H2H NaN with 0.5 uniformly (prevents NaN-pattern leakage)
     for h2h_col in ["h2h_win_rate_w", "h2h_surface_w", "h2h_recent_2y_w"]:
@@ -666,6 +739,25 @@ def get_live_features(
     rec["h2h_surface_w"]   = h2h["h2h_surface"]
     rec["h2h_recent_2y_w"] = h2h["h2h_recent_2y"]
     rec["h2h_n_matches"]   = h2h["h2h_n_matches"]
+
+    # Injury risk (live inference — reads injury_log.parquet directly)
+    import os as _os
+    _injury_path = Path(_os.environ.get("TENNIS_DATA_DIR", "data/processed")) / "injury_log.parquet"
+    if _injury_path.exists():
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).parent))
+        import injury_risk as _ir
+        _ir.CACHE = _injury_path
+        for prefix, player in [("w_", p1), ("l_", p2)]:
+            rs = _ir.risk_score(player, on_date=(date.date() if hasattr(date, "date") else date))
+            rec[f"{prefix}injury_risk_14d"] = rs["injury_risk_14d"]
+            rec[f"{prefix}retired_30d"]     = float(rs["retired_30d"])
+            rec[f"{prefix}walkover_60d"]    = float(rs["walkover_60d"])
+    else:
+        for prefix in ("w_", "l_"):
+            rec[f"{prefix}injury_risk_14d"] = 0.0
+            rec[f"{prefix}retired_30d"]     = 0.0
+            rec[f"{prefix}walkover_60d"]    = 0.0
 
     return rec
 

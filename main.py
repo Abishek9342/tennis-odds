@@ -26,6 +26,28 @@ def cmd_scrape(args):
     if args.years:
         paths = [p for p in paths if int(p.stem.split("_")[0]) in args.years]
     scraper.load_and_normalise(paths, out=RAW_PARQUET)
+    # Export latest known rank per player as rankings cache (used when Sofascore blocked)
+    _export_rankings_cache(RAW_PARQUET, MODEL_DIR)
+
+
+def _export_rankings_cache(raw_parquet: Path, model_dir: Path) -> None:
+    """Build rankings_cache.json from the most recent rank per player in raw data."""
+    import json
+    import pandas as pd
+    df = pd.read_parquet(raw_parquet).sort_values("date")
+    cache: dict[str, int] = {}
+    for col_player, col_rank in [("winner", "w_rank"), ("loser", "l_rank")]:
+        if col_rank not in df.columns:
+            continue
+        latest = df[[col_player, col_rank]].dropna().drop_duplicates(col_player, keep="last")
+        for _, row in latest.iterrows():
+            try:
+                cache[str(row[col_player])] = int(row[col_rank])
+            except (ValueError, TypeError):
+                pass
+    model_dir.mkdir(parents=True, exist_ok=True)
+    (model_dir / "rankings_cache.json").write_text(json.dumps(cache))
+    print(f"Rankings cache written: {len(cache)} players → {model_dir}/rankings_cache.json")
 
 
 def cmd_features(args):

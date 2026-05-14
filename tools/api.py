@@ -22,7 +22,9 @@ from typing import Optional
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+import os
+from fastapi import FastAPI, HTTPException, Security, status
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).parent.parent
@@ -33,6 +35,14 @@ MODEL_DIR = DATA / "models"
 DEFAULT_W = 0.65
 
 app = FastAPI(title="tennis-odds prediction API", version="1.0.0")
+
+# Optional API key auth — set API_KEY env var to enable; omit to run open (dev mode)
+_API_KEY = os.environ.get("API_KEY", "")
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+def _require_key(key: str | None = Security(_api_key_header)):
+    if _API_KEY and key != _API_KEY:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing API key")
 
 # Loaded once at startup
 _state: dict = {}
@@ -174,7 +184,7 @@ def health():
 
 
 @app.post("/predict")
-def predict(req: PredictIn):
+def predict(req: PredictIn, _=Security(_require_key)):
     try:
         return _predict_pair(req.p1, req.p2, req.surface, req.odds,
                               req.tournament, req.round_label)
@@ -183,7 +193,7 @@ def predict(req: PredictIn):
 
 
 @app.post("/simulate-tournament")
-def simulate_tournament(req: BracketIn):
+def simulate_tournament(req: BracketIn, _=Security(_require_key)):
     from tournament_sim import simulate
 
     surface = req.surface
@@ -196,7 +206,7 @@ def simulate_tournament(req: BracketIn):
 
 
 @app.post("/futures-edge")
-def futures_edge(req: FuturesIn):
+def futures_edge(req: FuturesIn, _=Security(_require_key)):
     from tournament_sim import simulate, futures_edge as _fe
 
     surface = req.surface

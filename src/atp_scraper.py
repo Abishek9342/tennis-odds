@@ -417,19 +417,33 @@ def to_internal_name(atp_full_name: str) -> str:
     return atp_full_name
 
 
-def get_live_rank_map(known_players: list[str], top_n: int = 200) -> dict[str, int]:
-    """Fetch live ATP rankings and return {internal_name: live_rank}."""
+def get_live_rank_map(known_players: list[str], top_n: int = 200,
+                      cache_path: "str | None" = None) -> dict[str, int]:
+    """Fetch live ATP rankings. Falls back to cache_path JSON if Sofascore fails."""
+    import json as _json
+    from pathlib import Path as _Path
+
     try:
         df = fetch_atp_rankings(top_n=top_n)
+        rank_map: dict[str, int] = {}
+        for _, row in df.iterrows():
+            internal = match_to_internal(str(row["player"]), known_players)
+            if internal:
+                rank_map[internal] = int(row["rank"])
+        return rank_map
     except Exception:
-        return {}
+        pass
 
-    rank_map: dict[str, int] = {}
-    for _, row in df.iterrows():
-        internal = match_to_internal(str(row["player"]), known_players)
-        if internal:
-            rank_map[internal] = int(row["rank"])
-    return rank_map
+    # Sofascore failed — try local/S3-synced cache
+    cache = _Path(cache_path) if cache_path else None
+    if cache and cache.exists():
+        try:
+            cached = _json.loads(cache.read_text())
+            print(f"  [rankings] Sofascore blocked — using cached rankings ({len(cached)} players)")
+            return {k: v for k, v in cached.items() if k in set(known_players)}
+        except Exception:
+            pass
+    return {}
 
 
 def _strip(t: str) -> str:

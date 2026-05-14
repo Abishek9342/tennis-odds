@@ -234,7 +234,35 @@ Resources:
       CorsConfiguration:
         AllowOrigins: ["*"]
         AllowMethods: ["GET", "POST", "OPTIONS"]
-        AllowHeaders: ["Content-Type", "Authorization"]
+        AllowHeaders: ["Content-Type", "Authorization", "X-API-Key"]
+
+  # ── CloudWatch alarms: alert Slack if prediction Lambda errors ────────────────
+  PredictErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: tennis-predict-errors
+      AlarmDescription: "tennis-predict-daily Lambda had errors — check CloudWatch logs"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: tennis-predict-daily
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref PredictAlarmTopic
+
+  PredictAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: tennis-predict-alarm
+      Subscription:
+        - Protocol: https
+          Endpoint: !Ref SlackWebhook
 
 # ── Outputs ───────────────────────────────────────────────────────────────────
 Outputs:
