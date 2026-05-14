@@ -903,10 +903,21 @@ def main():
             except Exception as e:
                 print(f"  Warning: SHAP explanation failed: {e}")
 
-        # Feature 5: notify integration
+        # Feature 5: notify integration (dedup — skip if already alerted today)
         if _notify_mod is not None:
             try:
-                _notify_mod.send_bet_alert(bet_info_meta, p1_m, p2_m, surface_m, tourn_m)
+                today_str = str(datetime.date.today())
+                already_alerted = False
+                if pred_log_path.exists():
+                    _log = pd.read_csv(pred_log_path)
+                    _dups = _log[
+                        (_log.get("date", pd.Series(dtype=str)).astype(str) == today_str) &
+                        (_log.get("Player 1", pd.Series(dtype=str)).astype(str).str.contains(p1_m.split()[0], na=False)) &
+                        (_log.get("Bet Recommendation", pd.Series(dtype=str)).astype(str).str.startswith("BET", na=False))
+                    ]
+                    already_alerted = len(_dups) > 1  # >1 means already logged+alerted before
+                if not already_alerted:
+                    _notify_mod.send_bet_alert(bet_info_meta, p1_m, p2_m, surface_m, tourn_m)
             except Exception:
                 pass  # fail silently if notify is not configured
 
